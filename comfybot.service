@@ -1,0 +1,17 @@
+[Unit]
+Description=ComfyUI Telegram Bot
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+WorkingDirectory=/opt/MyReplicaBot
+EnvironmentFile=/opt/MyReplicaBot/.env
+ExecStart=/opt/MyReplicaBot/venv/bin/python bot.py
+Restart=on-failure
+RestartSec=5
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=multi-user.target

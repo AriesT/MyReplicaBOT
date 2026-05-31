@@ -1,0 +1,52 @@
+# Environment & secrets
+.env
+
+# Database (contains user data)
+*.db
+*.db-shm
+*.db-wal
+
+# Migration backups
+*.json.bak
+
+# Generated images
+images/
+outputs/
+
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+.Python
+venv/
+env/
+.venv/
+*.egg-info/
+dist/
+build/
+.eggs/
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# macOS
+.DS_Store
+.AppleDouble
+.LSOverride
+
+# Windows
+Thumbs.db
+ehthumbs.db
+Desktop.ini
+nssm.exe
+
+# Logs
+*.log
+
+# Claude Code
+.claude/
