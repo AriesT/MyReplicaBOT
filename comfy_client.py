@@ -573,7 +573,10 @@ async def _run_comfy_workflow(
                         now = time.monotonic()
                         if now - last_upd >= 0.8:
                             last_upd = now
-                            await on_progress(edata.get("value", 0), edata.get("max", steps_hint))
+                            try:
+                                await on_progress(edata.get("value", 0), edata.get("max", steps_hint))
+                            except Exception:
+                                pass  # never let a progress callback error break generation
 
                     elif etype == "executed" and edata.get("prompt_id") == prompt_id:
                         for img in edata.get("output", {}).get("images", []):

@@ -5,7 +5,8 @@ from typing import Optional
 
 from aiogram import Bot, Dispatcher, F
 from aiogram.exceptions import TelegramBadRequest
-from aiogram.filters import CommandStart, StateFilter
+from aiogram.filters import Command, CommandStart, StateFilter
+from aiogram.types import BotCommand, BotCommandScopeAllPrivateChats
 from aiogram.filters.callback_data import CallbackData
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
@@ -19,6 +20,7 @@ from aiogram.utils.keyboard import InlineKeyboardBuilder
 import comfy_client
 import config
 import database
+import game_api
 import gen_queue as gq
 import history as hist
 import loras as loras_db
@@ -430,6 +432,9 @@ def kb_settings() -> InlineKeyboardMarkup:
     b.button(text="📊 Статистика генерацій",     callback_data="stats:all")
     b.button(text="📜 Повна історія",            callback_data=HistoryCB(action="show",     uid=-1).pack())
     b.button(text="🗑 Очистити всю історію",      callback_data=HistoryCB(action="clearall", uid=-1).pack())
+    if game_api.is_configured():
+        icon = "🔴 Стоп MMORPG-генерацію" if _game_gen_running() else "🎮 Генерація предметів MMORPG"
+        b.button(text=icon, callback_data="game:gen")
     b.button(text="🔙 Головне меню",             callback_data="menu:main")
     b.adjust(1)
     return b.as_markup()
@@ -1172,6 +1177,118 @@ async def cmd_start(message: Message, state: FSMContext) -> None:
         parse_mode="HTML", reply_markup=kb_main(admin),
     )
 
+# ── /help ─────────────────────────────────────────────────────────────────
+
+@dp.message(Command("help"))
+async def cmd_help(message: Message) -> None:
+    allowed, admin = _ctx(message.from_user)
+    if not allowed:
+        await message.answer("⛔ У вас немає доступу до цього бота.")
+        return
+    lines = [
+        "🤖 <b>MyReplicaBot — команди</b>\n",
+        "/start — головне меню",
+        "/gen — швидкий старт генерації",
+        "/settings — налаштування генерації",
+        "/history — моя історія зображень",
+        "/status — статус ComfyUI",
+        "/help — ця довідка",
+    ]
+    if admin:
+        lines += [
+            "",
+            "👑 <b>Адміністраторські:</b>",
+            "/users — управління користувачами",
+        ]
+    await message.answer("\n".join(lines), parse_mode="HTML")
+
+
+# ── /gen ──────────────────────────────────────────────────────────────────
+
+@dp.message(Command("gen"))
+async def cmd_gen(message: Message, state: FSMContext) -> None:
+    allowed, _ = _ctx(message.from_user)
+    if not allowed:
+        await message.answer("⛔ У вас немає доступу до цього бота.")
+        return
+    gs   = db.get_gen_settings(message.from_user.id)
+    mode = gs.get("mode", "text2img")
+    if mode == "img2img":
+        await message.answer(
+            "🖼 <b>Режим img2img</b>\n\nНадішліть фото (можна одразу з підписом як промпт).",
+            parse_mode="HTML", reply_markup=kb_cancel_to_main(),
+        )
+    else:
+        await state.set_state(GenState.waiting_prompt)
+        await message.answer("✏️ Введіть текстовий промпт для генерації зображення:",
+                             reply_markup=kb_cancel_to_main())
+
+
+# ── /settings ─────────────────────────────────────────────────────────────
+
+@dp.message(Command("settings"))
+async def cmd_settings(message: Message, state: FSMContext) -> None:
+    allowed, _ = _ctx(message.from_user)
+    if not allowed:
+        await message.answer("⛔ У вас немає доступу до цього бота.")
+        return
+    await state.clear()
+    tg_id = message.from_user.id
+    await message.answer(_gen_settings_text(tg_id),
+                         parse_mode="HTML", reply_markup=kb_gen_settings(tg_id))
+
+
+# ── /history ──────────────────────────────────────────────────────────────
+
+@dp.message(Command("history"))
+async def cmd_history(message: Message) -> None:
+    allowed, _ = _ctx(message.from_user)
+    if not allowed:
+        await message.answer("⛔ У вас немає доступу до цього бота.")
+        return
+    entries = hist.get_user_history(message.from_user.id)
+    if not entries:
+        await message.answer("📭 Історія порожня — ще немає згенерованих зображень.")
+        return
+    entry   = entries[0]
+    total   = len(entries)
+    caption = _hist_caption(entry, 1, total, message.from_user.id, message.from_user.id)
+    try:
+        await message.answer_photo(
+            FSInputFile(entry["file_path"]),
+            caption=caption,
+            parse_mode="HTML",
+            reply_markup=kb_hist_nav(0, total, 0),
+        )
+    except Exception:
+        await message.answer(caption, parse_mode="HTML",
+                             reply_markup=kb_hist_nav(0, total, 0))
+
+
+# ── /status ───────────────────────────────────────────────────────────────
+
+@dp.message(Command("status"))
+async def cmd_status(message: Message) -> None:
+    allowed, _ = _ctx(message.from_user)
+    if not allowed:
+        await message.answer("⛔ У вас немає доступу до цього бота.")
+        return
+    msg = await message.answer("🔄 Перевіряю...")
+    await msg.edit_text(await _build_status_text(message.from_user.id),
+                        parse_mode="HTML", reply_markup=kb_status())
+
+
+# ── /users (admin) ────────────────────────────────────────────────────────
+
+@dp.message(Command("users"))
+async def cmd_users(message: Message) -> None:
+    _, admin = _ctx(message.from_user)
+    if not admin:
+        await message.answer("⛔ Доступ лише для адміністраторів.")
+        return
+    await message.answer(_users_text(), parse_mode="HTML", reply_markup=kb_users())
+
+
 # ── генерація ─────────────────────────────────────────────────────────────
 
 @dp.callback_query(F.data == "gen:start")
@@ -1413,54 +1530,38 @@ async def _do_generate(
     batch_size = int(user_settings.get("batch_size", 1))
     log.info("Enqueue user=%d batch=%d prompt=%r", actual_user.id, batch_size, en_prompt)
 
-    remaining = [batch_size]
-    results:  list[bytes] = []
-    errors:   list[str]   = []
+    _mode  = user_settings.get("mode", "text2img")
+    _ckpt  = user_settings.get("checkpoint") or config.CHECKPOINT
+    _w     = user_settings.get("width")      or config.IMAGE_WIDTH
+    _h     = user_settings.get("height")     or config.IMAGE_HEIGHT
+    if user_settings.get("hires_fix"):
+        _w = _w * 2
+        _h = _h * 2
+    _uname = actual_user.username or ""
+
+    # Build prompt caption once (Telegram photo caption limit: 1024 chars)
+    _caption = f"<b>Промпт:</b> {en_prompt}"
+    if en_prompt != prompt:
+        _orig = prompt if len(prompt) <= 150 else prompt[:150] + "…"
+        _caption += f"\n<i>🇺🇦 {_orig}</i>"
+    _caption_overflow = len(_caption) > 1024
+
+    remaining    = [batch_size]
+    sent_count   = [0]       # how many images have already been sent
+    errors:  list[str] = []
 
     async def _finalize(msg: Message) -> None:
+        """Called when all batch jobs are finished. Cleans up status and shows menu."""
         try:
             await status.delete()
         except TelegramBadRequest:
             pass
         _, admin = _ctx(actual_user)
-        if not results and not errors:
+        if sent_count[0] == 0 and not errors:
             await msg.answer("❌ Генерацію скасовано.", reply_markup=kb_main(admin))
             return
-        _mode  = user_settings.get("mode", "text2img")
-        _ckpt  = user_settings.get("checkpoint") or config.CHECKPOINT
-        _w     = user_settings.get("width")      or config.IMAGE_WIDTH
-        _h     = user_settings.get("height")     or config.IMAGE_HEIGHT
-        if user_settings.get("hires_fix"):
-            _w = _w * 2
-            _h = _h * 2
-        _uname = actual_user.username or ""
-
-        saved = [hist.save_image(actual_user.id, b) for b in results]
-        # Build caption (Telegram limit: 1024 chars)
-        _MAX_CAP = 1024
-        _caption = f"<b>Промпт:</b> {en_prompt}"
-        if en_prompt != prompt:
-            _orig = prompt if len(prompt) <= 150 else prompt[:150] + "…"
-            _caption += f"\n<i>🇺🇦 {_orig}</i>"
-        _caption_overflow = len(_caption) > _MAX_CAP
-        _photo_caption = None if _caption_overflow else _caption
-        if len(saved) >= 2:
-            media = [
-                InputMediaPhoto(
-                    media=FSInputFile(fp),
-                    caption=_photo_caption if i == 0 else None,
-                    parse_mode="HTML" if i == 0 else None,
-                )
-                for i, (eid, fp) in enumerate(saved)
-            ]
-            await msg.answer_media_group(media)
-            for eid, fp in saved:
-                hist.add_entry(eid, fp, actual_user.id, _uname, en_prompt, _mode, _ckpt, _w, _h)
-        elif len(saved) == 1:
-            eid, fp = saved[0]
-            await msg.answer_photo(FSInputFile(fp), caption=_photo_caption, parse_mode="HTML")
-            hist.add_entry(eid, fp, actual_user.id, _uname, en_prompt, _mode, _ckpt, _w, _h)
-        if _caption_overflow:
+        # If prompt was too long to fit in photo caption — send it as a text message now
+        if _caption_overflow and sent_count[0] > 0:
             await msg.answer(_caption, parse_mode="HTML")
         for err in errors:
             await msg.answer(err, parse_mode="HTML")
@@ -1468,8 +1569,25 @@ async def _do_generate(
 
     async def on_done(msg: Message, image_bytes: bytes, pmt: str) -> None:
         remaining[0] -= 1
-        results.append(image_bytes)
         db.increment_gen_count(actual_user.id)
+
+        # Save to disk and history immediately
+        eid, fp = hist.save_image(actual_user.id, image_bytes)
+        hist.add_entry(eid, fp, actual_user.id, _uname, en_prompt, _mode, _ckpt, _w, _h)
+
+        # Attach caption to the first image only (if it fits)
+        photo_caption = None
+        if sent_count[0] == 0 and not _caption_overflow:
+            photo_caption = _caption
+        sent_count[0] += 1
+
+        # Send image right away — don't wait for the rest of the batch
+        await msg.answer_photo(
+            FSInputFile(fp),
+            caption=photo_caption,
+            parse_mode="HTML" if photo_caption else None,
+        )
+
         if remaining[0] == 0:
             await _finalize(msg)
 
@@ -3322,6 +3440,394 @@ async def handle_new_role(call: CallbackQuery, state: FSMContext) -> None:
     await call.answer(f"✅ @{username} додано як {role_text}.", show_alert=True)
     await call.message.edit_text(_users_text(), parse_mode="HTML", reply_markup=kb_users())
 
+# ── MMORPG game item generation ──────────────────────────────────────────
+
+_game_gen_task: Optional[asyncio.Task] = None
+
+
+def _game_gen_running() -> bool:
+    return _game_gen_task is not None and not _game_gen_task.done()
+
+
+def _kb_game_stop() -> InlineKeyboardMarkup:
+    return (InlineKeyboardBuilder()
+            .button(text="⛔ Зупинити генерацію", callback_data="game:stop")
+            .as_markup())
+
+
+@dp.callback_query(F.data == "game:gen")
+async def cb_game_gen(call: CallbackQuery) -> None:
+    _, admin = _ctx(call.from_user)
+    if not admin:
+        await call.answer("⛔ Доступ лише для адміністраторів.", show_alert=True)
+        return
+    await call.answer()
+
+    if _game_gen_running():
+        await call.answer("⚙️ Генерація вже запущена.", show_alert=True)
+        return
+
+    global _game_gen_task
+    _game_gen_task = asyncio.create_task(
+        _run_game_gen(call.message, call.from_user)
+    )
+
+
+@dp.callback_query(F.data == "game:stop")
+async def cb_game_stop(call: CallbackQuery) -> None:
+    _, admin = _ctx(call.from_user)
+    if not admin:
+        await call.answer("⛔", show_alert=True)
+        return
+    if _game_gen_running():
+        _game_gen_task.cancel()
+        await call.answer("⛔ Зупиняю…", show_alert=False)
+    else:
+        await call.answer("ℹ️ Генерація вже завершена.", show_alert=True)
+        await call.message.edit_reply_markup(reply_markup=None)
+
+
+def _to_webp(png_bytes: bytes, quality: int = 85) -> bytes:
+    """Convert image bytes to WebP for smaller uploads."""
+    from PIL import Image
+    from io import BytesIO as _BytesIO
+    img = Image.open(_BytesIO(png_bytes)).convert("RGB")
+    out = _BytesIO()
+    img.save(out, format="WEBP", quality=quality)
+    return out.getvalue()
+
+
+# ── game-gen helpers ──────────────────────────────────────────────────────
+
+async def _gg_edit(status_ref: list, trigger_msg: Message,
+                   text: str, **kwargs) -> None:
+    """Edit status message; if deleted — recreate it transparently."""
+    try:
+        await status_ref[0].edit_text(text, **kwargs)
+    except TelegramBadRequest as e:
+        msg = str(e).lower()
+        if "not found" in msg or "can't be edited" in msg:
+            try:
+                status_ref[0] = await trigger_msg.answer(text, **kwargs)
+            except Exception:
+                pass
+    except Exception:
+        pass
+
+
+async def _gg_wait_for(
+    service_name: str,
+    check_fn,                  # async () -> bool
+    edit_fn,                   # async (text, **kw) -> None  — may be None for silent waits
+    interval: int = 30,
+) -> None:
+    """
+    Block until check_fn() returns True.
+    Updates the status message (via edit_fn) every `interval` seconds.
+    Raises CancelledError transparently if the task is cancelled while waiting.
+    """
+    import time as _time
+    attempt   = 0
+    started   = _time.monotonic()
+
+    while not await check_fn():
+        attempt += 1
+        elapsed  = int(_time.monotonic() - started)
+        mins, s  = divmod(elapsed, 60)
+        t_str    = f"{mins}хв {s:02d}с" if mins else f"{s}с"
+        log.warning("game_gen: %s unavailable, attempt %d, waiting %ds (elapsed %s)",
+                    service_name, attempt, interval, t_str)
+        if edit_fn:
+            await edit_fn(
+                f"⏸ <b>{service_name} недоступний</b>\n\n"
+                f"⏳ Чекаю відновлення… спроба <b>{attempt}</b>\n"
+                f"Пройшло: <b>{t_str}</b>  •  Перевірка через {interval}с",
+                parse_mode="HTML", reply_markup=_kb_game_stop(),
+            )
+        await asyncio.sleep(interval)
+
+    if attempt > 0:
+        log.info("game_gen: %s back online after %d attempts", service_name, attempt)
+        if edit_fn:
+            await edit_fn(
+                f"✅ <b>{service_name} відновлено!</b> Продовжую…",
+                parse_mode="HTML", reply_markup=_kb_game_stop(),
+            )
+            await asyncio.sleep(1)
+
+
+async def _check_game_api() -> bool:
+    """Quick availability check for the game API (does NOT count against rate limits)."""
+    try:
+        await game_api.fetch_items()
+        return True
+    except asyncio.CancelledError:
+        raise
+    except Exception:
+        return False
+
+
+async def _gg_generate(
+    prompt: str,
+    on_progress,
+    user_settings: dict,
+    edit_fn,
+) -> bytes:
+    """
+    Generate image with automatic recovery:
+    - Waits for ComfyUI if offline before starting
+    - If ComfyUI drops mid-generation → waits for it, then retries once
+    """
+    await _gg_wait_for("ComfyUI", comfy_client.ping, edit_fn)
+
+    for attempt in range(2):          # initial try + 1 recovery
+        try:
+            return await comfy_client.generate(
+                prompt, on_progress=on_progress, user_settings=user_settings,
+            )
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            log.warning("game_gen: generate error (attempt %d): %s", attempt + 1, exc)
+            if attempt == 0 and not await comfy_client.ping():
+                # ComfyUI went down mid-generation — wait and retry
+                await _gg_wait_for("ComfyUI", comfy_client.ping, edit_fn)
+                continue
+            raise
+
+
+async def _gg_upload(
+    item_id:    str,
+    webp_bytes: bytes,
+    filename:   str,
+    edit_fn     = None,
+) -> tuple[bool, str]:
+    """
+    Upload with full recovery and status updates:
+    - Transient errors (5xx / connection / 429) → wait for Game API (with status msg), retry
+    - Permanent errors (4xx except 429)         → return failure immediately
+    """
+    attempt = 0
+    while True:
+        attempt += 1
+        try:
+            success, result = await game_api.upload_image(item_id, webp_bytes, filename)
+            if success:
+                return True, result
+            is_transient = (
+                "HTTP 5" in result
+                or "HTTP 429" in result
+                or "timed out" in result.lower()
+                or "connection" in result.lower()
+            )
+            if not is_transient:
+                log.error("game_gen: upload permanent failure %s: %s", item_id, result)
+                return False, result
+            log.warning("game_gen: upload transient %s (attempt %d): %s",
+                        item_id, attempt, result)
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            log.warning("game_gen: upload exception %s (attempt %d): %s",
+                        item_id, attempt, exc)
+
+        # Wait for Game API to come back — with visible status update
+        await _gg_wait_for("Game API", _check_game_api,
+                           edit_fn=edit_fn, interval=30)
+        await asyncio.sleep(min(attempt * 2, 30))
+
+
+# ── main background task ──────────────────────────────────────────────────
+
+async def _run_game_gen(trigger_msg: Message, admin_user) -> None:
+    """Fetch items → generate variants → show each → upload (parallel with retry)."""
+    import time as _time
+    from aiogram.types import BufferedInputFile
+
+    status_ref: list = [None]   # mutable holder so _gg_edit can replace it
+
+    async def _edit(text: str, **kw) -> None:
+        await _gg_edit(status_ref, trigger_msg, text, **kw)
+
+    # ── wait for ComfyUI (initial check) ─────────────────────────────────
+    status_ref[0] = await trigger_msg.answer(
+        "🔄 Перевіряю ComfyUI…", reply_markup=_kb_game_stop(),
+    )
+    await _gg_wait_for("ComfyUI", comfy_client.ping, _edit)
+
+    # ── wait for Game API + fetch items ───────────────────────────────────
+    await _edit("🔄 Отримую список предметів…",
+                parse_mode="HTML", reply_markup=_kb_game_stop())
+
+    items: list[game_api.GameItem] = []
+    while not items:
+        await _gg_wait_for("Game API", _check_game_api, _edit)
+        try:
+            items = await game_api.fetch_items()
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            log.warning("game_gen: fetch_items error: %s", exc)
+            items = []
+            continue
+        if not items:
+            await _edit("✅ <b>Всі предмети вже мають зображення!</b>",
+                        parse_mode="HTML", reply_markup=kb_settings())
+            return
+
+    if not items:
+        await _edit("✅ <b>Всі предмети вже мають зображення!</b>",
+                    parse_mode="HTML", reply_markup=kb_settings())
+        return
+
+    total_items = len(items)
+    total_slots = sum(i.slots_remaining for i in items)
+    await _edit(
+        f"🎮 <b>Генерація предметів MMORPG</b>\n\n"
+        f"Предметів: <b>{total_items}</b>  •  Зображень: <b>{total_slots}</b>\n"
+        f"Модель: <b>{user_settings_ckpt_label(admin_user.id)}</b>\nПочинаю…",
+        parse_mode="HTML", reply_markup=_kb_game_stop(),
+    )
+
+    # ── gen settings ─────────────────────────────────────────────────────
+    user_settings = dict(db.get_gen_settings(admin_user.id))
+    _ckpt = user_settings.get("checkpoint") or config.CHECKPOINT
+    user_settings["_workflow_type"] = models_db.get_workflow(_ckpt)
+    user_settings["mode"]       = "text2img"
+    user_settings["batch_size"] = 1
+
+    ok_count   = 0
+    fail_count = 0
+    fail_names: list[str] = []
+    done_slots = 0
+
+    try:
+        for item_idx, item in enumerate(items, 1):
+            needed = item.slots_remaining
+
+            for variant in range(1, needed + 1):
+                done_slots += 1
+
+                # ── progress header ───────────────────────────────────────
+                bar_fill    = int(20 * (done_slots - 1) / total_slots)
+                slots_bar   = "▓" * bar_fill + "░" * (20 - bar_fill)
+                rarity_tag  = f"  <i>[{item.rarity}]</i>" if item.rarity else ""
+                variant_tag = f"  <i>варіант {variant}/{needed}</i>" if needed > 1 else ""
+                item_header = (
+                    f"🎮 <b>Генерація предметів MMORPG</b>\n\n"
+                    f"<code>{slots_bar}</code>  {done_slots - 1}/{total_slots}\n"
+                    f"📦 {item_idx}/{total_items}  "
+                    f"⚙️ <b>{item.name}</b>{rarity_tag}{variant_tag}"
+                )
+                await _edit(item_header, parse_mode="HTML",
+                            reply_markup=_kb_game_stop())
+
+                # ── on_progress ───────────────────────────────────────────
+                _last_upd = [0.0]
+
+                async def on_progress(step: int, total_steps: int,
+                                      _hdr: str = item_header) -> None:
+                    now = _time.monotonic()
+                    if now - _last_upd[0] < 1.0:
+                        return
+                    _last_upd[0] = now
+                    step_bar = comfy_client.progress_bar(step, total_steps)
+                    await _edit(
+                        f"{_hdr}\n\n<code>{step_bar}</code>  крок {step}/{total_steps}",
+                        parse_mode="HTML", reply_markup=_kb_game_stop(),
+                    )
+
+                # ── generate (ComfyUI-wait + retry) ──────────────────────
+                try:
+                    png_bytes = await _gg_generate(
+                        item.prompt, on_progress, user_settings, _edit,
+                    )
+                except asyncio.CancelledError:
+                    raise
+                except Exception as exc:
+                    log.error("game_gen: generation failed %s v%d: %s",
+                              item.id, variant, exc)
+                    fail_count += 1
+                    fail_names.append(f"{item.name} v{variant} (gen: {str(exc)[:60]})")
+                    continue
+
+                # ── convert to WebP ───────────────────────────────────────
+                try:
+                    webp_bytes = await asyncio.get_running_loop().run_in_executor(
+                        None, _to_webp, png_bytes,
+                    )
+                except Exception as exc:
+                    log.warning("game_gen: WebP conversion failed %s: %s", item.id, exc)
+                    webp_bytes = png_bytes
+
+                # ── show result ───────────────────────────────────────────
+                caption = (
+                    f"✅ <b>{item.name}</b>{rarity_tag}"
+                    + (f"\nВаріант {variant}/{needed}" if needed > 1 else "")
+                    + f"\n<i>Предмет {item_idx}/{total_items}  •  Слот {done_slots}/{total_slots}</i>"
+                )
+                try:
+                    await trigger_msg.answer_photo(
+                        BufferedInputFile(png_bytes, filename=f"{item.id}_v{variant}.png"),
+                        caption=caption, parse_mode="HTML",
+                    )
+                except Exception as exc:
+                    log.warning("game_gen: send photo failed %s v%d: %s",
+                                item.id, variant, exc)
+
+                # ── upload (Game API-wait + retry, inline with status) ────
+                await _edit(
+                    f"{item_header}\n\n⬆️ Завантажую на сервер…",
+                    parse_mode="HTML", reply_markup=_kb_game_stop(),
+                )
+                success, result = await _gg_upload(
+                    item.id, webp_bytes,
+                    f"{item.id}_v{variant}.webp",
+                    edit_fn=_edit,
+                )
+                if success:
+                    ok_count += 1
+                    log.info("game_gen: ✓ %s v%d → %s", item.id, variant, result)
+                else:
+                    fail_count += 1
+                    fail_names.append(f"{item.name} v{variant} (upload: {result[:60]})")
+                    log.warning("game_gen: ✗ %s v%d — %s", item.id, variant, result)
+
+    except asyncio.CancelledError:
+        log.info("game_gen: cancelled — ok=%d fail=%d done=%d/%d",
+                 ok_count, fail_count, done_slots, total_slots)
+        await _edit(
+            f"⛔ <b>Генерацію зупинено</b>\n\n"
+            f"✅ Завантажено: <b>{ok_count}</b>\n"
+            f"🖼 Зроблено: <b>{done_slots}</b> з <b>{total_slots}</b>",
+            parse_mode="HTML", reply_markup=kb_settings(),
+        )
+        return
+
+    # ── summary ───────────────────────────────────────────────────────────
+    summary_lines = [
+        "🎮 <b>Генерація предметів завершена!</b>\n",
+        f"✅ Завантажено:  <b>{ok_count}</b>",
+        f"❌ Помилок:     <b>{fail_count}</b>",
+        f"🖼 Зображень:   <b>{total_slots}</b>  (по {game_api.MAX_CANDIDATES} на предмет)",
+        f"📦 Предметів:   <b>{total_items}</b>",
+    ]
+    if fail_names:
+        summary_lines.append("\n<b>Не вдалось:</b>")
+        for n in fail_names[:10]:
+            summary_lines.append(f"  • {n}")
+        if len(fail_names) > 10:
+            summary_lines.append(f"  … та ще {len(fail_names) - 10}")
+
+    await _edit("\n".join(summary_lines), parse_mode="HTML", reply_markup=kb_settings())
+
+
+def user_settings_ckpt_label(tg_id: int) -> str:
+    s = db.get_gen_settings(tg_id)
+    ckpt = s.get("checkpoint") or config.CHECKPOINT
+    return _label(ckpt, models_db.labels())
+
+
 # ── запуск ────────────────────────────────────────────────────────────────
 
 async def _notify_admins(text: str) -> None:
@@ -3332,9 +3838,24 @@ async def _notify_admins(text: str) -> None:
             except Exception:
                 pass
 
+async def _set_commands() -> None:
+    """Register bot commands so they appear in the Telegram command menu."""
+    user_commands = [
+        BotCommand(command="start",    description="🏠 Головне меню"),
+        BotCommand(command="gen",      description="🎨 Згенерувати зображення"),
+        BotCommand(command="settings", description="🎛 Налаштування генерації"),
+        BotCommand(command="history",  description="📜 Моя історія зображень"),
+        BotCommand(command="status",   description="📊 Статус ComfyUI"),
+        BotCommand(command="help",     description="❓ Довідка"),
+    ]
+    await bot.set_my_commands(user_commands, scope=BotCommandScopeAllPrivateChats())
+    log.info("Bot commands registered: %s", [c.command for c in user_commands])
+
+
 async def main() -> None:
     database.init()
     await bot.delete_webhook(drop_pending_updates=True)
+    await _set_commands()
     log.info("Checking ComfyUI at %s...", config.COMFY_URL)
     if await comfy_client.ping():
         log.info("ComfyUI is online.")
