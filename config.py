@@ -17,6 +17,7 @@ NEGATIVE_PROMPT: str = os.getenv(
 )
 POLL_INTERVAL: float = float(os.getenv("POLL_INTERVAL", "2.0"))
 POLL_TIMEOUT: float = float(os.getenv("POLL_TIMEOUT", "300.0"))
+VIDEO_POLL_TIMEOUT: float = float(os.getenv("VIDEO_POLL_TIMEOUT", "1800.0"))  # 30 min for video
 
 # MMORPG Game API integration (optional)
 GAME_API_URL: str = os.getenv("GAME_API_URL", "")

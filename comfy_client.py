@@ -544,16 +544,18 @@ async def _run_comfy_workflow(
     workflow: dict,
     on_progress: Optional[Callable[[int, int], Awaitable[None]]] = None,
     steps_hint: int = 20,
+    poll_timeout: Optional[float] = None,
 ) -> bytes:
-    """Submit a workflow to ComfyUI via WebSocket, wait for output, return image bytes."""
+    """Submit a workflow to ComfyUI via WebSocket, wait for output, return bytes."""
     client_id = str(uuid.uuid4())
     ws_url    = config.COMFY_URL.replace("http://", "ws://").replace("https://", "wss://")
     last_upd  = 0.0
+    timeout   = poll_timeout or config.POLL_TIMEOUT
 
     async with aiohttp.ClientSession() as session:
         async with session.ws_connect(
             f"{ws_url}/ws?clientId={client_id}",
-            timeout=aiohttp.ClientTimeout(total=config.POLL_TIMEOUT),
+            timeout=aiohttp.ClientTimeout(total=timeout),
         ) as ws:
             resp = await session.post(
                 f"{config.COMFY_URL}/prompt",
@@ -644,3 +646,255 @@ async def upscale_image(
     fname    = await upload_image(image_bytes, f"tgbot_usc_{uuid.uuid4().hex[:8]}.png")
     workflow = _build_workflow_upscale(fname, width, height, scale, upscale_model)
     return await _run_comfy_workflow(workflow, on_progress, 1)
+
+
+# ── LTX-Video ─────────────────────────────────────────────────────────────
+
+# LTX-Video requires frames = 8*n + 1  (9, 17, 25, 33, 49, 65, 97 …)
+VIDEO_FRAME_PRESETS = [17, 25, 33, 49, 65]
+VIDEO_FPS_PRESETS   = [8, 12, 16, 24]
+VIDEO_STEPS_PRESETS = [20, 25, 30, 40]
+VIDEO_CFG_PRESETS   = [2.0, 3.0, 3.5, 4.0, 5.0, 7.0]
+VIDEO_RES_PRESETS   = [
+    ("480×288",   480,  288),   # safe for 6 GB VRAM
+    ("512×288",   512,  288),
+    ("640×352",   640,  352),
+    ("768×512",   768,  512),
+    ("512×512",   512,  512),
+    ("480×480",   480,  480),
+    ("1280×480", 1280,  480),   # wide cinematic / banner
+]
+
+# T5 variants recognised for LTXV
+_LTXV_T5_VARIANTS = {
+    "t5xxl_fp8_e4m3fn_scaled.safetensors",
+    "t5xxl_fp8_e4m3fn.safetensors",
+    "t5\\t5xxl_fp16.safetensors",
+    "t5xxl_fp16.safetensors",
+}
+
+_VIDEO_NEG_DEFAULT = (
+    "low quality, worst quality, deformed, distorted, blurry, "
+    "jittery, flickering, artifacts, noisy, ugly, watermark"
+)
+
+
+async def fetch_video_models() -> list[str]:
+    """Return LTX-Video checkpoints available in ComfyUI."""
+    all_models = await fetch_checkpoints()
+    return [m for m in all_models
+            if any(k in m.lower() for k in ("ltx", "ltxv", "ltx-video"))]
+
+
+async def _find_ltxv_t5(clips: list[str]) -> str:
+    """Return best available T5 encoder for LTXV (prefer fp8 scaled)."""
+    for want in (
+        "t5xxl_fp8_e4m3fn_scaled.safetensors",
+        "t5xxl_fp8_e4m3fn.safetensors",
+        "t5xxl_fp16.safetensors",
+    ):
+        for c in clips:
+            if c.replace("\\", "/").split("/")[-1] == want:
+                return c
+    # fallback: any T5
+    for c in clips:
+        if "t5" in c.lower():
+            return c
+    return "t5xxl_fp8_e4m3fn_scaled.safetensors"
+
+
+def _ltxv_frames(requested: int) -> int:
+    """Snap to nearest valid LTXV frame count (8n+1, min 9)."""
+    n = max(1, round((requested - 1) / 8))
+    return 8 * n + 1
+
+
+def _build_workflow_ltxv_t2v(prompt: str, s: dict, t5_name: str) -> dict:
+    """LTX-Video text-to-video workflow."""
+    model   = s.get("video_model")   or "ltx-video-2b-v0.9.5.safetensors"
+    width   = int(s.get("video_width")  or 480)
+    height  = int(s.get("video_height") or 288)
+    frames  = _ltxv_frames(int(s.get("video_frames") or 25))
+    fps     = float(s.get("video_fps")   or 8)
+    steps   = int(s.get("video_steps")  or 25)
+    cfg     = float(s.get("video_cfg")  or 3.5)
+    neg     = s.get("video_negative")   or _VIDEO_NEG_DEFAULT
+    seed    = uuid.uuid4().int & 0xFFFFFFFFFFFFFFFF
+
+    return {
+        # ── loaders ──────────────────────────────────────────────────────
+        "1": {"class_type": "CLIPLoader",
+              "inputs": {"clip_name": t5_name, "type": "ltxv"}},
+        "2": {"class_type": "CheckpointLoaderSimple",
+              "inputs": {"ckpt_name": model}},
+        # ── text encoding ─────────────────────────────────────────────────
+        "3": {"class_type": "CLIPTextEncode",
+              "inputs": {"text": prompt, "clip": ["1", 0]}},
+        "4": {"class_type": "CLIPTextEncode",
+              "inputs": {"text": neg, "clip": ["1", 0]}},
+        # ── latent + model patching ───────────────────────────────────────
+        "5": {"class_type": "EmptyLTXVLatentVideo",
+              "inputs": {"width": width, "height": height,
+                         "length": frames, "batch_size": 1}},
+        "6": {"class_type": "ModelSamplingLTXV",
+              "inputs": {"model": ["2", 0], "max_shift": 2.05,
+                         "base_shift": 0.95, "latent": ["5", 0]}},
+        # ── conditioning + schedule ───────────────────────────────────────
+        "7": {"class_type": "LTXVConditioning",
+              "inputs": {"positive": ["3", 0], "negative": ["4", 0],
+                         "frame_rate": fps}},
+        "8": {"class_type": "LTXVScheduler",
+              "inputs": {"steps": steps, "max_shift": 2.05, "base_shift": 0.95,
+                         "stretch": True, "terminal": 0.1, "latent": ["5", 0]}},
+        # ── sampling ──────────────────────────────────────────────────────
+        "9":  {"class_type": "KSamplerSelect",  "inputs": {"sampler_name": "euler"}},
+        "10": {"class_type": "RandomNoise",      "inputs": {"noise_seed": seed}},
+        "11": {"class_type": "CFGGuider",
+               "inputs": {"model": ["6", 0], "positive": ["7", 0],
+                          "negative": ["7", 1], "cfg": cfg}},
+        "12": {"class_type": "SamplerCustomAdvanced",
+               "inputs": {"noise": ["10", 0], "guider": ["11", 0],
+                          "sampler": ["9", 0], "sigmas": ["8", 0],
+                          "latent_image": ["5", 0]}},
+        # ── decode + save ─────────────────────────────────────────────────
+        "13": {"class_type": "VAEDecode",
+               "inputs": {"samples": ["12", 0], "vae": ["2", 2]}},
+        "14": {"class_type": "SaveAnimatedWEBP",
+               "inputs": {"images": ["13", 0],
+                          "filename_prefix": "tgbot_video",
+                          "fps": fps, "lossless": False,
+                          "quality": 85, "method": "default"}},
+    }
+
+
+def _build_workflow_ltxv_i2v(prompt: str, s: dict,
+                               t5_name: str, input_filename: str) -> dict:
+    """
+    LTX-Video image-to-video workflow.
+
+    Extra settings read from `s`:
+      video_strength       (float 0.5-1.0)  – how much animation deviates from source
+      video_loop           (bool)            – add LTXVAddGuide at last frame = seamless loop
+      video_img_compression(int  0-100)      – LTXVPreprocess compression level
+    """
+    model       = s.get("video_model")           or "ltx-video-2b-v0.9.5.safetensors"
+    width       = int(s.get("video_width")       or 480)
+    height      = int(s.get("video_height")      or 288)
+    frames      = _ltxv_frames(int(s.get("video_frames") or 25))
+    fps         = float(s.get("video_fps")       or 8)
+    steps       = int(s.get("video_steps")       or 25)
+    cfg         = float(s.get("video_cfg")       or 3.5)
+    neg         = s.get("video_negative")        or _VIDEO_NEG_DEFAULT
+    strength    = float(s.get("video_strength")  or 1.0)
+    loop        = bool(s.get("video_loop",  False))
+    compression = int(s.get("video_img_compression") or 35)
+    seed        = uuid.uuid4().int & 0xFFFFFFFFFFFFFFFF
+
+    # ── base workflow nodes ───────────────────────────────────────────────
+    wf: dict = {
+        # loaders
+        "1": {"class_type": "CLIPLoader",
+              "inputs": {"clip_name": t5_name, "type": "ltxv"}},
+        "2": {"class_type": "CheckpointLoaderSimple",
+              "inputs": {"ckpt_name": model}},
+        # text encoding
+        "3": {"class_type": "CLIPTextEncode",
+              "inputs": {"text": prompt, "clip": ["1", 0]}},
+        "4": {"class_type": "CLIPTextEncode",
+              "inputs": {"text": neg, "clip": ["1", 0]}},
+        # LTXV conditioning (adds frame_rate metadata)
+        "5": {"class_type": "LTXVConditioning",
+              "inputs": {"positive": ["3", 0], "negative": ["4", 0],
+                         "frame_rate": fps}},
+        # load + preprocess input image
+        "6": {"class_type": "LoadImage",
+              "inputs": {"image": input_filename}},
+        "7": {"class_type": "LTXVPreprocess",
+              "inputs": {"image": ["6", 0], "img_compression": compression}},
+        # img2vid  → outputs: [0]=positive COND, [1]=negative COND, [2]=LATENT
+        "8": {"class_type": "LTXVImgToVideo",
+              "inputs": {"positive": ["5", 0], "negative": ["5", 1],
+                         "vae": ["2", 2], "image": ["7", 0],
+                         "width": width, "height": height,
+                         "length": frames, "batch_size": 1,
+                         "strength": strength}},
+    }
+
+    # ── seamless loop: pin last frame = first frame via LTXVAddGuide ──────
+    # LTXVAddGuide outputs: [0]=positive COND, [1]=negative COND, [2]=LATENT
+    if loop:
+        wf["17"] = {
+            "class_type": "LTXVAddGuide",
+            "inputs": {
+                "positive":  ["8", 0],
+                "negative":  ["8", 1],
+                "vae":       ["2", 2],
+                "latent":    ["8", 2],
+                "image":     ["7", 0],   # same preprocessed image = last frame = first frame
+                "frame_idx": -1,         # -1 means the very last frame
+                "strength":  1.0,        # fully guide last frame to input image
+            },
+        }
+        cond_src  = "17"   # downstream uses guide-aware conditioning
+        latent_src = "17"
+    else:
+        cond_src  = "8"
+        latent_src = "8"
+
+    # ── model patching + schedule ─────────────────────────────────────────
+    wf["9"]  = {"class_type": "ModelSamplingLTXV",
+                "inputs": {"model": ["2", 0], "max_shift": 2.05,
+                           "base_shift": 0.95, "latent": [latent_src, 2]}}
+    wf["10"] = {"class_type": "LTXVScheduler",
+                "inputs": {"steps": steps, "max_shift": 2.05, "base_shift": 0.95,
+                           "stretch": True, "terminal": 0.1,
+                           "latent": [latent_src, 2]}}
+    # ── sampling ──────────────────────────────────────────────────────────
+    wf["11"] = {"class_type": "KSamplerSelect", "inputs": {"sampler_name": "euler"}}
+    wf["12"] = {"class_type": "RandomNoise",    "inputs": {"noise_seed": seed}}
+    wf["13"] = {"class_type": "CFGGuider",
+                "inputs": {"model": ["9", 0],
+                           "positive": [cond_src, 0],
+                           "negative": [cond_src, 1],
+                           "cfg": cfg}}
+    wf["14"] = {"class_type": "SamplerCustomAdvanced",
+                "inputs": {"noise": ["12", 0], "guider": ["13", 0],
+                           "sampler": ["11", 0], "sigmas": ["10", 0],
+                           "latent_image": [latent_src, 2]}}
+    # ── decode + save ─────────────────────────────────────────────────────
+    wf["15"] = {"class_type": "VAEDecode",
+                "inputs": {"samples": ["14", 0], "vae": ["2", 2]}}
+    wf["16"] = {"class_type": "SaveAnimatedWEBP",
+                "inputs": {"images": ["15", 0],
+                           "filename_prefix": "tgbot_video_i2v",
+                           "fps": fps, "lossless": False,
+                           "quality": 85, "method": "default"}}
+    return wf
+
+
+async def generate_video(
+    prompt: str,
+    on_progress: Optional[Callable[[int, int], Awaitable[None]]] = None,
+    user_settings: Optional[dict] = None,
+    input_image: Optional[bytes] = None,
+) -> bytes:
+    """Generate an animated WEBP video using LTX-Video. Returns animated WEBP bytes."""
+    s     = user_settings or {}
+    steps = int(s.get("video_steps") or 25)
+
+    clips   = await fetch_clip_models()
+    t5_name = await _find_ltxv_t5(clips)
+
+    if input_image is not None:
+        w, h = int(s.get("video_width") or 480), int(s.get("video_height") or 288)
+        resized = _resize(input_image, w, h)
+        fname   = await upload_image(resized, f"tgbot_vid_{uuid.uuid4().hex[:8]}.png")
+        workflow = _build_workflow_ltxv_i2v(prompt, s, t5_name, fname)
+    else:
+        workflow = _build_workflow_ltxv_t2v(prompt, s, t5_name)
+
+    # Use extended timeout for video
+    return await _run_comfy_workflow(
+        workflow, on_progress, steps,
+        poll_timeout=config.VIDEO_POLL_TIMEOUT,
+    )
