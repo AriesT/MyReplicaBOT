@@ -22,3 +22,10 @@ VIDEO_POLL_TIMEOUT: float = float(os.getenv("VIDEO_POLL_TIMEOUT", "1800.0"))  # 
 # MMORPG Game API integration (optional)
 GAME_API_URL: str = os.getenv("GAME_API_URL", "")
 GAME_API_KEY: str = os.getenv("GAME_API_KEY", "")
+
+# Qwen-Image 2.1 (files in ComfyUI models/)
+QWEN_UNET: str = os.getenv("QWEN_UNET", "qwen_image_2.1_int8_convrot.safetensors")
+QWEN_CLIP: str = os.getenv("QWEN_CLIP", "qwen3vl_8b_int8_convrot.safetensors")
+QWEN_VAE: str = os.getenv("QWEN_VAE", "qwen_image_2.1_vae_bf16.safetensors")
+QWEN_TURBO_LORA: str = os.getenv("QWEN_TURBO_LORA", "qwen21-turbo-6step-r128.safetensors")
+QWEN_POLL_TIMEOUT: float = float(os.getenv("QWEN_POLL_TIMEOUT", "1800.0"))

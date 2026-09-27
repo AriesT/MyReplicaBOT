@@ -28,6 +28,8 @@ class GenJob:
     batch_total:   int = 1
     cancel_kb:     Optional[InlineKeyboardMarkup] = None
     on_cancel:     Optional[Callable[[Message], Awaitable[None]]] = None
+    # custom executor (e.g. Qwen-Image) — replaces the default comfy_client.generate() path
+    runner:        Optional[Callable[["GenJob"], Awaitable[None]]] = None
 
 
 _queue:       list[GenJob]           = []
@@ -94,6 +96,10 @@ async def _worker() -> None:
 
 
 async def _run(job: GenJob) -> None:
+    if job.runner is not None:
+        await job.runner(job)
+        return
+
     is_i2i  = job.input_image is not None
     label   = "варіацію" if is_i2i else "зображення"
     counter = f"[{job.batch_index}/{job.batch_total}] " if job.batch_total > 1 else ""

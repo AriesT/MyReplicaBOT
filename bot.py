@@ -26,6 +26,7 @@ import history as hist
 import loras as loras_db
 import models as models_db
 import upscale_models as upscale_models_db
+import qwen_ui
 import translator
 import users as db
 
@@ -426,6 +427,7 @@ async def _build_status_text(tg_id: int) -> str:
 
 def kb_main(admin: bool) -> InlineKeyboardMarkup:
     b = InlineKeyboardBuilder()
+    b.button(text="🌀 Qwen-Image 2.1 ✨",       callback_data=qwen_ui.QwenCB(action="menu").pack())
     b.button(text="🎨 Згенерувати зображення", callback_data="gen:start")
     b.button(text="🎬 Генерація відео",         callback_data=VideoCB(action="menu").pack())
     b.button(text="📊 Статус ComfyUI",          callback_data="comfy:status")
@@ -1973,6 +1975,11 @@ async def cmd_gen(message: Message, state: FSMContext) -> None:
                              reply_markup=kb_cancel_to_main())
 
 
+@dp.message(Command("qwen"))
+async def cmd_qwen(message: Message, state: FSMContext) -> None:
+    await qwen_ui.cmd_qwen(message, state)
+
+
 # ── /settings ─────────────────────────────────────────────────────────────
 
 @dp.message(Command("settings"))
@@ -2046,6 +2053,9 @@ async def cb_gen_start(call: CallbackQuery, state: FSMContext) -> None:
     if not allowed:
         await call.answer("⛔ У вас немає доступу.", show_alert=True)
         return
+    if qwen_ui.is_active(call.from_user.id):
+        await qwen_ui.cb_prompt(call, state)
+        return
     gs   = db.get_gen_settings(call.from_user.id)
     mode = gs.get("mode", "text2img")
     if mode == "img2img":
@@ -2118,6 +2128,9 @@ async def handle_photo(message: Message, state: FSMContext) -> None:
     if not allowed:
         await message.answer("⛔ У вас немає доступу до цього бота.")
         return
+    if qwen_ui.is_active(message.from_user.id):
+        await qwen_ui.handle_photo_in_qwen_mode(message, state)
+        return
     gs   = db.get_gen_settings(message.from_user.id)
     mode = gs.get("mode", "text2img")
     if mode != "img2img":
@@ -2147,6 +2160,9 @@ async def handle_text(message: Message, state: FSMContext) -> None:
     allowed, _ = _ctx(message.from_user)
     if not allowed:
         await message.answer("⛔ У вас немає доступу до цього бота.")
+        return
+    if qwen_ui.is_active(message.from_user.id):
+        await qwen_ui.generate(message, message.text.strip(), message.from_user)
         return
     gs   = db.get_gen_settings(message.from_user.id)
     mode = gs.get("mode", "text2img")
@@ -5219,6 +5235,7 @@ async def _set_commands() -> None:
     """Register bot commands so they appear in the Telegram command menu."""
     user_commands = [
         BotCommand(command="start",    description="🏠 Головне меню"),
+        BotCommand(command="qwen",     description="🌀 Qwen-Image 2.1"),
         BotCommand(command="gen",      description="🎨 Згенерувати зображення"),
         BotCommand(command="settings", description="🎛 Налаштування генерації"),
         BotCommand(command="history",  description="📜 Моя історія зображень"),
@@ -5242,6 +5259,7 @@ async def main() -> None:
             f"⚠️ <b>ComfyUI недоступний при старті бота!</b>\n<code>{config.COMFY_URL}</code>"
         )
     log.info("Bot started. Model: %s", config.CHECKPOINT)
+    dp.include_router(qwen_ui.router)
     await dp.start_polling(bot)
 
 if __name__ == "__main__":

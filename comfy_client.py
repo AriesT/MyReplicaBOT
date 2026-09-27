@@ -898,3 +898,256 @@ async def generate_video(
         workflow, on_progress, steps,
         poll_timeout=config.VIDEO_POLL_TIMEOUT,
     )
+
+
+# ── Qwen-Image 2.1 ────────────────────────────────────────────────────────
+#
+# Text-to-image and reference-image editing. The model does not fit into
+# 6 GB VRAM, ComfyUI streams the rest from RAM (DynamicVRAM), so progress
+# reporting is richer here: stages, s/step, ETA and live latent previews.
+
+QWEN_QUALITY_PRESETS: dict[str, dict] = {
+    "turbo":   {"label": "⚡ Турбо",    "steps": 6,  "lora": True,  "hint": "6 кроків, ~1.5 хв"},
+    "quality": {"label": "💎 Якість",   "steps": 25, "lora": False, "hint": "25 кроків, ~5 хв"},
+    "max":     {"label": "👑 Максимум", "steps": 40, "lora": False, "hint": "40 кроків, ~8 хв"},
+}
+QWEN_RATIOS: dict[str, tuple[int, int]] = {
+    "1:1": (1, 1), "4:3": (4, 3), "3:4": (3, 4), "3:2": (3, 2),
+    "2:3": (2, 3), "16:9": (16, 9), "9:16": (9, 16),
+}
+QWEN_MEGAPIXELS = [0.5, 1.0, 2.0]
+
+_QWEN_TRANSPARENT_TMPL = (
+    "This is an RGBA format image with transparency. {p}. "
+    "The image has an alpha channel and a transparent background."
+)
+
+# measured seconds per sampling step at 1 MP, refined after every run
+_qwen_sec_per_step: dict[str, float] = {"turbo": 12.5, "quality": 12.5, "max": 12.5}
+
+
+def qwen_size(ratio: str, megapixels: float) -> tuple[int, int]:
+    a, b = QWEN_RATIOS.get(ratio, (1, 1))
+    area = megapixels * 1024 * 1024
+    w = (area * a / b) ** 0.5
+    h = area / w
+    return max(256, int(round(w / 32)) * 32), max(256, int(round(h / 32)) * 32)
+
+
+def qwen_settings(s: dict) -> dict:
+    """Normalise the user's qwen_* settings into a flat dict with defaults."""
+    quality = s.get("qwen_quality") if s.get("qwen_quality") in QWEN_QUALITY_PRESETS else "turbo"
+    ratio   = s.get("qwen_ratio") if s.get("qwen_ratio") in QWEN_RATIOS else "1:1"
+    mp      = float(s.get("qwen_mp") or 1.0)
+    if mp not in QWEN_MEGAPIXELS:
+        mp = 1.0
+    w, h = qwen_size(ratio, mp)
+    return {
+        "quality":     quality,
+        "steps":       QWEN_QUALITY_PRESETS[quality]["steps"],
+        "lora":        QWEN_QUALITY_PRESETS[quality]["lora"],
+        "ratio":       ratio,
+        "mp":          mp,
+        "width":       w,
+        "height":      h,
+        "transparent": bool(s.get("qwen_transparent", False)),
+        "translate":   bool(s.get("qwen_translate", True)),
+        "seed":        s.get("qwen_seed"),            # None → random
+        "negative":    s.get("qwen_negative") or "",
+        "cfg":         float(s.get("qwen_cfg") or 1.0),
+    }
+
+
+def qwen_estimate(q: dict) -> float:
+    """Rough total seconds for a Qwen job (sampling dominates)."""
+    per_step = _qwen_sec_per_step.get(q["quality"], 12.5) * (q["width"] * q["height"]) / (1024 * 1024)
+    if q["cfg"] > 1.0:
+        per_step *= 2
+    return q["steps"] * per_step + 15
+
+
+def _build_workflow_qwen21(prompt: str, q: dict, seed: int,
+                           ref_image: Optional[str] = None) -> dict:
+    if q["transparent"]:
+        prompt = _QWEN_TRANSPARENT_TMPL.format(p=prompt.rstrip(". "))
+    model_src: list = ["1", 0]
+    wf: dict = {
+        "1": {"class_type": "UNETLoader",
+              "inputs": {"unet_name": config.QWEN_UNET, "weight_dtype": "default"}},
+        "2": {"class_type": "CLIPLoader",
+              "inputs": {"clip_name": config.QWEN_CLIP, "type": "qwen_image", "device": "default"}},
+        "3": {"class_type": "VAELoader", "inputs": {"vae_name": config.QWEN_VAE}},
+    }
+    if q["lora"] and config.QWEN_TURBO_LORA:
+        wf["20"] = {"class_type": "LoraLoaderModelOnly",
+                    "inputs": {"model": model_src, "lora_name": config.QWEN_TURBO_LORA,
+                               "strength_model": 1.0}}
+        model_src = ["20", 0]
+    wf["4"] = {"class_type": "QwenImage21Cache",
+               "inputs": {"model": model_src, "device": "auto", "dtype": "default"}}
+    enc = {"clip": ["2", 0], "prompt": prompt, "negative_prompt": q["negative"],
+           "resolution": 1024, "vae": ["3", 0]}
+    if ref_image:
+        wf["10"] = {"class_type": "LoadImage", "inputs": {"image": ref_image}}
+        enc["images.image_1"] = ["10", 0]
+        latent_src = ["5", 2]          # latent sized from the reference image
+    else:
+        wf["6"] = {"class_type": "EmptyLatentImage",
+                   "inputs": {"width": q["width"], "height": q["height"], "batch_size": 1}}
+        latent_src = ["6", 0]
+    wf["5"] = {"class_type": "TextEncodeQwenImage21", "inputs": enc}
+    wf["7"] = {"class_type": "KSampler",
+               "inputs": {"seed": seed, "steps": q["steps"], "cfg": q["cfg"],
+                          "sampler_name": "euler", "scheduler": "simple", "denoise": 1.0,
+                          "model": ["4", 0], "positive": ["5", 0], "negative": ["5", 1],
+                          "latent_image": latent_src}}
+    wf["8"] = {"class_type": "VAEDecode", "inputs": {"samples": ["7", 0], "vae": ["3", 0]}}
+    wf["9"] = {"class_type": "SaveImage",
+               "inputs": {"filename_prefix": "tgbot_qwen", "images": ["8", 0]}}
+    return wf
+
+
+# node id → stage shown to the user
+QWEN_STAGES: dict[str, str] = {
+    "1": "load", "2": "load", "3": "load", "20": "load", "4": "load", "10": "load",
+    "5": "encode", "6": "load", "7": "sample", "8": "decode", "9": "save",
+}
+
+
+def _parse_preview(data: bytes) -> Optional[bytes]:
+    """Extract JPEG/PNG bytes from a ComfyUI binary WS frame (types 1 and 4)."""
+    if len(data) < 8:
+        return None
+    etype = int.from_bytes(data[:4], "big")
+    if etype == 1:                        # PREVIEW_IMAGE: type, img_format, bytes
+        return data[8:]
+    if etype == 4:                        # PREVIEW_IMAGE_WITH_METADATA: type, meta_len, meta, bytes
+        mlen = int.from_bytes(data[4:8], "big")
+        return data[8 + mlen:]
+    return None
+
+
+async def generate_qwen(
+    prompt: str,
+    q: dict,
+    on_status: Optional[Callable[[dict], Awaitable[None]]] = None,
+    input_image: Optional[bytes] = None,
+) -> tuple[bytes, int]:
+    """Run Qwen-Image 2.1. Returns (png_bytes, seed).
+
+    on_status receives a dict: stage, step, total, elapsed, eta, sec_per_step,
+    preview (latest preview JPEG or None). It is called on every event —
+    throttling is the caller's job.
+    """
+    seed = int(q["seed"]) if q.get("seed") is not None else uuid.uuid4().int & 0xFFFFFFFFFFFF
+    ref_name = None
+    if input_image is not None:
+        ref_name = await upload_image(_to_png(input_image), f"tgbot_qref_{uuid.uuid4().hex[:8]}.png")
+    workflow = _build_workflow_qwen21(prompt, q, seed, ref_name)
+
+    client_id = str(uuid.uuid4())
+    ws_url    = config.COMFY_URL.replace("http://", "ws://").replace("https://", "wss://")
+    t0        = time.monotonic()
+    state     = {"stage": "queue", "step": 0, "total": q["steps"], "elapsed": 0.0,
+                 "eta": qwen_estimate(q), "sec_per_step": None, "preview": None}
+    sample_t0: Optional[float] = None
+
+    async def emit() -> None:
+        if on_status is None:
+            return
+        state["elapsed"] = time.monotonic() - t0
+        try:
+            await on_status(dict(state))
+        except Exception:
+            pass  # never let a UI error break generation
+
+    async with aiohttp.ClientSession() as session:
+        async with session.ws_connect(
+            f"{ws_url}/ws?clientId={client_id}",
+            timeout=aiohttp.ClientTimeout(total=config.QWEN_POLL_TIMEOUT),
+            max_msg_size=0,
+        ) as ws:
+            resp = await session.post(f"{config.COMFY_URL}/prompt",
+                                      json={"prompt": workflow, "client_id": client_id})
+            if not resp.ok:
+                raise RuntimeError(f"ComfyUI {resp.status}: {await resp.text()}")
+            prompt_id: str = (await resp.json())["prompt_id"]
+            await emit()
+
+            async for msg in ws:
+                if msg.type == aiohttp.WSMsgType.BINARY:
+                    img = _parse_preview(msg.data)
+                    if img:
+                        state["preview"] = img
+                        await emit()
+                    continue
+                if msg.type in (aiohttp.WSMsgType.CLOSED, aiohttp.WSMsgType.ERROR):
+                    raise RuntimeError("WebSocket closed unexpectedly")
+                if msg.type != aiohttp.WSMsgType.TEXT:
+                    continue
+
+                event = json.loads(msg.data)
+                etype = event.get("type")
+                edata = event.get("data", {})
+                if edata.get("prompt_id") not in (None, prompt_id):
+                    continue
+
+                if etype == "executing" and edata.get("node"):
+                    stage = QWEN_STAGES.get(str(edata["node"]), state["stage"])
+                    if stage == "sample" and sample_t0 is None:
+                        sample_t0 = time.monotonic()
+                    state["stage"] = stage
+                    await emit()
+
+                elif etype == "progress" and state["stage"] == "sample":
+                    step, total = edata.get("value", 0), edata.get("max", q["steps"])
+                    state["step"], state["total"] = step, total
+                    if sample_t0 is not None and step > 0:
+                        sps = (time.monotonic() - sample_t0) / step
+                        state["sec_per_step"] = sps
+                        state["eta"] = sps * (total - step) + 8
+                    await emit()
+
+                elif etype == "executed":
+                    for img in edata.get("output", {}).get("images", []):
+                        if img.get("type") != "output":
+                            continue
+                        r = await session.get(
+                            f"{config.COMFY_URL}/view",
+                            params={"filename": img["filename"],
+                                    "subfolder": img.get("subfolder", ""), "type": "output"},
+                        )
+                        r.raise_for_status()
+                        data = await r.read()
+                        if state["sec_per_step"]:
+                            # refine the 1 MP estimate (exclude step 1 warm-up noise by blending)
+                            norm = state["sec_per_step"] * (1024 * 1024) / (q["width"] * q["height"])
+                            if q["cfg"] > 1.0:
+                                norm /= 2
+                            old = _qwen_sec_per_step.get(q["quality"], norm)
+                            _qwen_sec_per_step[q["quality"]] = old * 0.5 + norm * 0.5
+                        return data, seed
+
+                elif etype == "execution_error":
+                    raise RuntimeError(f"ComfyUI: {edata.get('exception_message', 'execution error')}")
+
+                elif etype == "execution_interrupted":
+                    raise RuntimeError("ComfyUI: генерацію перервано")
+
+    raise RuntimeError("Workflow completed without output image")
+
+
+def _to_png(data: bytes) -> bytes:
+    img = Image.open(BytesIO(data))
+    img = img.convert("RGBA" if img.mode in ("RGBA", "LA", "P") else "RGB")
+    out = BytesIO()
+    img.save(out, format="PNG")
+    return out.getvalue()
+
+
+async def interrupt() -> None:
+    try:
+        async with aiohttp.ClientSession(timeout=_CONNECT_TIMEOUT) as s:
+            await s.post(f"{config.COMFY_URL}/interrupt")
+    except Exception:
+        pass
