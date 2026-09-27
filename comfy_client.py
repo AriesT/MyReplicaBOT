@@ -1027,29 +1027,28 @@ def _parse_preview(data: bytes) -> Optional[bytes]:
     return None
 
 
-async def generate_qwen(
-    prompt: str,
-    q: dict,
+async def run_workflow_rich(
+    workflow: dict,
+    stages: dict[str, str],
+    steps_hint: int,
+    eta: float,
     on_status: Optional[Callable[[dict], Awaitable[None]]] = None,
-    input_image: Optional[bytes] = None,
-) -> tuple[bytes, int]:
-    """Run Qwen-Image 2.1. Returns (png_bytes, seed).
+    timeout: Optional[float] = None,
+    output_key: str = "images",
+) -> bytes:
+    """Submit a workflow and stream rich status until the first output file arrives.
 
-    on_status receives a dict: stage, step, total, elapsed, eta, sec_per_step,
-    preview (latest preview JPEG or None). It is called on every event —
-    throttling is the caller's job.
+    stages maps node id → stage name. on_status receives a dict: stage, step,
+    total, elapsed, eta, sec_per_step, preview (latest preview JPEG or None),
+    progress_node. Called on every event — throttling is the caller's job.
+    Progress of the "sample" stage drives step/total/eta; progress of any other
+    stage (e.g. an LLM writing audio codes) is reported via stage_step/stage_total.
     """
-    seed = int(q["seed"]) if q.get("seed") is not None else uuid.uuid4().int & 0xFFFFFFFFFFFF
-    ref_name = None
-    if input_image is not None:
-        ref_name = await upload_image(_to_png(input_image), f"tgbot_qref_{uuid.uuid4().hex[:8]}.png")
-    workflow = _build_workflow_qwen21(prompt, q, seed, ref_name)
-
     client_id = str(uuid.uuid4())
     ws_url    = config.COMFY_URL.replace("http://", "ws://").replace("https://", "wss://")
     t0        = time.monotonic()
-    state     = {"stage": "queue", "step": 0, "total": q["steps"], "elapsed": 0.0,
-                 "eta": qwen_estimate(q), "sec_per_step": None, "preview": None}
+    state     = {"stage": "queue", "step": 0, "total": steps_hint, "elapsed": 0.0, "eta": eta,
+                 "sec_per_step": None, "preview": None, "stage_step": 0, "stage_total": 0}
     sample_t0: Optional[float] = None
 
     async def emit() -> None:
@@ -1064,7 +1063,7 @@ async def generate_qwen(
     async with aiohttp.ClientSession() as session:
         async with session.ws_connect(
             f"{ws_url}/ws?clientId={client_id}",
-            timeout=aiohttp.ClientTimeout(total=config.QWEN_POLL_TIMEOUT),
+            timeout=aiohttp.ClientTimeout(total=timeout or config.QWEN_POLL_TIMEOUT),
             max_msg_size=0,
         ) as ws:
             resp = await session.post(f"{config.COMFY_URL}/prompt",
@@ -1093,40 +1092,39 @@ async def generate_qwen(
                     continue
 
                 if etype == "executing" and edata.get("node"):
-                    stage = QWEN_STAGES.get(str(edata["node"]), state["stage"])
+                    stage = stages.get(str(edata["node"]), state["stage"])
                     if stage == "sample" and sample_t0 is None:
                         sample_t0 = time.monotonic()
+                    if stage != state["stage"]:
+                        state["stage_step"] = state["stage_total"] = 0
                     state["stage"] = stage
                     await emit()
 
-                elif etype == "progress" and state["stage"] == "sample":
-                    step, total = edata.get("value", 0), edata.get("max", q["steps"])
-                    state["step"], state["total"] = step, total
-                    if sample_t0 is not None and step > 0:
-                        sps = (time.monotonic() - sample_t0) / step
-                        state["sec_per_step"] = sps
-                        state["eta"] = sps * (total - step) + 8
+                elif etype == "progress":
+                    step, total = edata.get("value", 0), edata.get("max", steps_hint)
+                    if state["stage"] == "sample":
+                        state["step"], state["total"] = step, total
+                        if sample_t0 is not None and step > 0:
+                            sps = (time.monotonic() - sample_t0) / step
+                            state["sec_per_step"] = sps
+                            state["eta"] = sps * (total - step) + 5
+                    else:
+                        state["stage_step"], state["stage_total"] = step, total
                     await emit()
 
                 elif etype == "executed":
-                    for img in edata.get("output", {}).get("images", []):
-                        if img.get("type") != "output":
+                    for item in edata.get("output", {}).get(output_key, []):
+                        if item.get("type") != "output":
                             continue
                         r = await session.get(
                             f"{config.COMFY_URL}/view",
-                            params={"filename": img["filename"],
-                                    "subfolder": img.get("subfolder", ""), "type": "output"},
+                            params={"filename": item["filename"],
+                                    "subfolder": item.get("subfolder", ""), "type": "output"},
                         )
                         r.raise_for_status()
-                        data = await r.read()
-                        if state["sec_per_step"]:
-                            # refine the 1 MP estimate (exclude step 1 warm-up noise by blending)
-                            norm = state["sec_per_step"] * (1024 * 1024) / (q["width"] * q["height"])
-                            if q["cfg"] > 1.0:
-                                norm /= 2
-                            old = _qwen_sec_per_step.get(q["quality"], norm)
-                            _qwen_sec_per_step[q["quality"]] = old * 0.5 + norm * 0.5
-                        return data, seed
+                        state["done_sec_per_step"] = state["sec_per_step"]
+                        run_workflow_rich.last_state = dict(state)
+                        return await r.read()
 
                 elif etype == "execution_error":
                     raise RuntimeError(f"ComfyUI: {edata.get('exception_message', 'execution error')}")
@@ -1134,7 +1132,32 @@ async def generate_qwen(
                 elif etype == "execution_interrupted":
                     raise RuntimeError("ComfyUI: генерацію перервано")
 
-    raise RuntimeError("Workflow completed without output image")
+    raise RuntimeError("Workflow completed without output")
+
+
+async def generate_qwen(
+    prompt: str,
+    q: dict,
+    on_status: Optional[Callable[[dict], Awaitable[None]]] = None,
+    input_image: Optional[bytes] = None,
+) -> tuple[bytes, int]:
+    """Run Qwen-Image 2.1. Returns (png_bytes, seed)."""
+    seed = int(q["seed"]) if q.get("seed") is not None else uuid.uuid4().int & 0xFFFFFFFFFFFF
+    ref_name = None
+    if input_image is not None:
+        ref_name = await upload_image(_to_png(input_image), f"tgbot_qref_{uuid.uuid4().hex[:8]}.png")
+    workflow = _build_workflow_qwen21(prompt, q, seed, ref_name)
+    data = await run_workflow_rich(workflow, QWEN_STAGES, q["steps"], qwen_estimate(q),
+                                   on_status, config.QWEN_POLL_TIMEOUT, "images")
+    sps = run_workflow_rich.last_state.get("done_sec_per_step")
+    if sps:
+        # refine the 1 MP estimate for the next ETA
+        norm = sps * (1024 * 1024) / (q["width"] * q["height"])
+        if q["cfg"] > 1.0:
+            norm /= 2
+        old = _qwen_sec_per_step.get(q["quality"], norm)
+        _qwen_sec_per_step[q["quality"]] = old * 0.5 + norm * 0.5
+    return data, seed
 
 
 def _to_png(data: bytes) -> bytes:
@@ -1151,3 +1174,135 @@ async def interrupt() -> None:
             await s.post(f"{config.COMFY_URL}/interrupt")
     except Exception:
         pass
+
+run_workflow_rich.last_state = {}
+
+
+# ── Music & sound: ACE-Step 1.5 (songs) + Stable Audio 3 (sounds) ────────
+
+SONG_DURATIONS = [30, 60, 90, 120, 180, 240]
+SONG_LANGUAGES = {"uk": "🇺🇦 Українська", "en": "🇬🇧 English", "pl": "🇵🇱 Polski", "de": "🇩🇪 Deutsch",
+                  "es": "🇪🇸 Español", "fr": "🇫🇷 Français", "it": "🇮🇹 Italiano", "ja": "🇯🇵 日本語",
+                  "ko": "🇰🇷 한국어", "zh": "🇨🇳 中文"}
+SONG_BPMS      = [70, 90, 100, 110, 120, 128, 140, 170]
+SONG_KEYS      = ["C major", "G major", "D major", "A major", "E major", "F major",
+                  "A minor", "E minor", "D minor", "B minor", "F# minor", "C minor"]
+SONG_LMS       = {"1.7b": "qwen_1.7b_ace15.safetensors", "4b": "qwen_4b_ace15.safetensors"}
+SONG_INSTRUMENTAL = "[Instrumental]"
+
+SOUND_DURATIONS  = [3, 5, 10, 20, 30, 60, 120]
+SOUND_CATEGORIES = {
+    "sfx":        ("💥 Звуковий ефект", "Sound effect: {p}"),
+    "oneshot":    ("🥁 One-shot семпл",  "One-shot sample, single hit: {p}"),
+    "instrument": ("🎻 Інструмент",      "Solo instrument recording: {p}"),
+    "ambient":    ("🌲 Атмосфера",       "Ambient soundscape: {p}"),
+    "music":      ("🎶 Музика (інструментал)", "{p}"),
+}
+SOUND_MODELS = {
+    "small_sfx": ("⚡ Small SFX — швидка, для ефектів", "stable_audio_3_small_sfx.safetensors"),
+    "medium":    ("💎 Medium — універсальна, для музики й атмосфери", "stable_audio_3_medium.safetensors"),
+}
+
+SONG_STAGES  = {"1": "load", "2": "load", "3": "load", "4": "load", "7": "load",
+                "5": "compose", "6": "compose", "8": "sample", "9": "decode", "10": "save"}
+SOUND_STAGES = {"1": "load", "2": "load", "5": "load", "3": "encode", "4": "encode",
+                "6": "sample", "7": "decode", "8": "save"}
+
+
+def song_settings(s: dict) -> dict:
+    dur  = int(s.get("song_duration") or 60)
+    lang = s.get("song_language") if s.get("song_language") in SONG_LANGUAGES else "uk"
+    bpm  = int(s.get("song_bpm") or 120)
+    key  = s.get("song_key") if s.get("song_key") in SONG_KEYS else "C major"
+    lm   = s.get("song_lm") if s.get("song_lm") in SONG_LMS else "1.7b"
+    return {"duration": dur if dur in SONG_DURATIONS else 60, "language": lang, "bpm": bpm,
+            "key": key, "timesig": "3" if s.get("song_timesig") == "3" else "4",
+            "lm": lm, "codes": bool(s.get("song_codes", True)), "seed": s.get("song_seed")}
+
+
+def sound_settings(s: dict) -> dict:
+    cat = s.get("sound_category") if s.get("sound_category") in SOUND_CATEGORIES else "sfx"
+    dur = int(s.get("sound_duration") or 10)
+    mdl = s.get("sound_model") if s.get("sound_model") in SOUND_MODELS else "auto"
+    if mdl == "auto":
+        mdl = "small_sfx" if cat in ("sfx", "oneshot") else "medium"
+    return {"category": cat, "duration": dur if dur in SOUND_DURATIONS else 10,
+            "model": mdl, "model_setting": s.get("sound_model") or "auto", "seed": s.get("sound_seed")}
+
+
+def song_estimate(m: dict) -> float:
+    lm = 0.07 if m["lm"] == "1.7b" else 0.2           # seconds per audio-code token (5 per sec of audio)
+    return 25 + (m["duration"] * 5 * lm if m["codes"] else 0) + m["duration"] * 0.1
+
+
+def sound_estimate(m: dict) -> float:
+    return 12 + m["duration"] * (0.15 if m["model"] == "small_sfx" else 0.4)
+
+
+def _build_workflow_song(tags: str, lyrics: str, m: dict, seed: int) -> dict:
+    return {
+        "1": {"class_type": "UNETLoader",
+              "inputs": {"unet_name": config.ACE_UNET, "weight_dtype": "default"}},
+        "2": {"class_type": "DualCLIPLoader",
+              "inputs": {"clip_name1": config.ACE_CLIP, "clip_name2": SONG_LMS[m["lm"]],
+                         "type": "ace", "device": "default"}},
+        "3": {"class_type": "VAELoader", "inputs": {"vae_name": config.ACE_VAE}},
+        "4": {"class_type": "ModelSamplingAuraFlow", "inputs": {"model": ["1", 0], "shift": 3.0}},
+        "5": {"class_type": "TextEncodeAceStepAudio1.5",
+              "inputs": {"clip": ["2", 0], "tags": tags, "lyrics": lyrics, "seed": seed,
+                         "bpm": m["bpm"], "duration": float(m["duration"]),
+                         "timesignature": m["timesig"], "language": m["language"],
+                         "keyscale": m["key"], "generate_audio_codes": m["codes"],
+                         "cfg_scale": 2.0, "temperature": 0.85, "top_p": 0.9, "top_k": 0, "min_p": 0.0}},
+        "6": {"class_type": "ConditioningZeroOut", "inputs": {"conditioning": ["5", 0]}},
+        "7": {"class_type": "EmptyAceStep1.5LatentAudio",
+              "inputs": {"seconds": float(m["duration"]), "batch_size": 1}},
+        "8": {"class_type": "KSampler",
+              "inputs": {"seed": seed, "steps": 8, "cfg": 1.0, "sampler_name": "euler",
+                         "scheduler": "simple", "denoise": 1.0, "model": ["4", 0],
+                         "positive": ["5", 0], "negative": ["6", 0], "latent_image": ["7", 0]}},
+        "9": {"class_type": "VAEDecodeAudio", "inputs": {"samples": ["8", 0], "vae": ["3", 0]}},
+        "10": {"class_type": "SaveAudioMP3",
+               "inputs": {"audio": ["9", 0], "filename_prefix": "audio/tgbot_song", "quality": "V0"}},
+    }
+
+
+def _build_workflow_sound(prompt: str, m: dict, seed: int) -> dict:
+    text = SOUND_CATEGORIES[m["category"]][1].format(p=prompt)
+    return {
+        "1": {"class_type": "CheckpointLoaderSimple",
+              "inputs": {"ckpt_name": SOUND_MODELS[m["model"]][1]}},
+        "2": {"class_type": "CLIPLoader",
+              "inputs": {"clip_name": config.SA3_CLIP, "type": "stable_audio", "device": "default"}},
+        "3": {"class_type": "CLIPTextEncode", "inputs": {"clip": ["2", 0], "text": text}},
+        "4": {"class_type": "CLIPTextEncode", "inputs": {"clip": ["2", 0], "text": ""}},
+        "5": {"class_type": "EmptyLatentAudio",
+              "inputs": {"seconds": float(m["duration"]), "batch_size": 1}},
+        "6": {"class_type": "KSampler",
+              "inputs": {"seed": seed, "steps": 8, "cfg": 1.0, "sampler_name": "lcm",
+                         "scheduler": "simple", "denoise": 1.0, "model": ["1", 0],
+                         "positive": ["3", 0], "negative": ["4", 0], "latent_image": ["5", 0]}},
+        "7": {"class_type": "VAEDecodeAudio", "inputs": {"samples": ["6", 0], "vae": ["1", 2]}},
+        "8": {"class_type": "SaveAudioMP3",
+              "inputs": {"audio": ["7", 0], "filename_prefix": "audio/tgbot_sound", "quality": "V0"}},
+    }
+
+
+async def generate_song(tags: str, lyrics: str, m: dict,
+                        on_status: Optional[Callable[[dict], Awaitable[None]]] = None
+                        ) -> tuple[bytes, int]:
+    seed = int(m["seed"]) if m.get("seed") is not None else uuid.uuid4().int & 0xFFFFFFFF
+    wf = _build_workflow_song(tags, lyrics or SONG_INSTRUMENTAL, m, seed)
+    data = await run_workflow_rich(wf, SONG_STAGES, 8, song_estimate(m), on_status,
+                                   config.QWEN_POLL_TIMEOUT, "audio")
+    return data, seed
+
+
+async def generate_sound(prompt: str, m: dict,
+                         on_status: Optional[Callable[[dict], Awaitable[None]]] = None
+                         ) -> tuple[bytes, int]:
+    seed = int(m["seed"]) if m.get("seed") is not None else uuid.uuid4().int & 0xFFFFFFFF
+    wf = _build_workflow_sound(prompt, m, seed)
+    data = await run_workflow_rich(wf, SOUND_STAGES, 8, sound_estimate(m), on_status,
+                                   config.QWEN_POLL_TIMEOUT, "audio")
+    return data, seed

@@ -26,6 +26,7 @@ import history as hist
 import loras as loras_db
 import models as models_db
 import upscale_models as upscale_models_db
+import music_ui
 import qwen_ui
 import translator
 import users as db
@@ -428,6 +429,7 @@ async def _build_status_text(tg_id: int) -> str:
 def kb_main(admin: bool) -> InlineKeyboardMarkup:
     b = InlineKeyboardBuilder()
     b.button(text="🌀 Qwen-Image 2.1 ✨",       callback_data=qwen_ui.QwenCB(action="menu").pack())
+    b.button(text="🎵 Музика та звуки",         callback_data=music_ui.MusCB(action="menu").pack())
     b.button(text="🎨 Згенерувати зображення", callback_data="gen:start")
     b.button(text="🎬 Генерація відео",         callback_data=VideoCB(action="menu").pack())
     b.button(text="📊 Статус ComfyUI",          callback_data="comfy:status")
@@ -436,7 +438,7 @@ def kb_main(admin: bool) -> InlineKeyboardMarkup:
     b.button(text="📜 Історія генерацій",        callback_data=HistoryCB(action="show", uid=0).pack())
     if admin:
         b.button(text="⚙️ Налаштування",        callback_data="menu:settings")
-    b.adjust(1)
+    b.adjust(2, 1)
     return b.as_markup()
 
 def kb_settings() -> InlineKeyboardMarkup:
@@ -1973,6 +1975,11 @@ async def cmd_gen(message: Message, state: FSMContext) -> None:
         await state.set_state(GenState.waiting_prompt)
         await message.answer("✏️ Введіть текстовий промпт для генерації зображення:",
                              reply_markup=kb_cancel_to_main())
+
+
+@dp.message(Command("music"))
+async def cmd_music(message: Message, state: FSMContext) -> None:
+    await music_ui.cmd_music(message, state)
 
 
 @dp.message(Command("qwen"))
@@ -5236,6 +5243,7 @@ async def _set_commands() -> None:
     user_commands = [
         BotCommand(command="start",    description="🏠 Головне меню"),
         BotCommand(command="qwen",     description="🌀 Qwen-Image 2.1"),
+        BotCommand(command="music",    description="🎵 Музика та звуки"),
         BotCommand(command="gen",      description="🎨 Згенерувати зображення"),
         BotCommand(command="settings", description="🎛 Налаштування генерації"),
         BotCommand(command="history",  description="📜 Моя історія зображень"),
@@ -5260,6 +5268,7 @@ async def main() -> None:
         )
     log.info("Bot started. Model: %s", config.CHECKPOINT)
     dp.include_router(qwen_ui.router)
+    dp.include_router(music_ui.router)
     await dp.start_polling(bot)
 
 if __name__ == "__main__":
