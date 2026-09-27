@@ -907,9 +907,9 @@ async def generate_video(
 # reporting is richer here: stages, s/step, ETA and live latent previews.
 
 QWEN_QUALITY_PRESETS: dict[str, dict] = {
-    "turbo":   {"label": "⚡ Турбо",    "steps": 6,  "lora": True,  "hint": "6 кроків, ~1.5 хв"},
-    "quality": {"label": "💎 Якість",   "steps": 25, "lora": False, "hint": "25 кроків, ~5 хв"},
-    "max":     {"label": "👑 Максимум", "steps": 40, "lora": False, "hint": "40 кроків, ~8 хв"},
+    "turbo":   {"label": "⚡ Турбо",    "steps": 6,  "lora": True,  "hint": "6 кроків, ~25 с"},
+    "quality": {"label": "💎 Якість",   "steps": 25, "lora": False, "hint": "25 кроків, ~1.2 хв"},
+    "max":     {"label": "👑 Максимум", "steps": 40, "lora": False, "hint": "40 кроків, ~2 хв"},
 }
 QWEN_RATIOS: dict[str, tuple[int, int]] = {
     "1:1": (1, 1), "4:3": (4, 3), "3:4": (3, 4), "3:2": (3, 2),
@@ -923,7 +923,7 @@ _QWEN_TRANSPARENT_TMPL = (
 )
 
 # measured seconds per sampling step at 1 MP, refined after every run
-_qwen_sec_per_step: dict[str, float] = {"turbo": 12.5, "quality": 12.5, "max": 12.5}
+_qwen_sec_per_step: dict[str, float] = {"turbo": 2.7, "quality": 2.7, "max": 2.7}
 
 
 def qwen_size(ratio: str, megapixels: float) -> tuple[int, int]:
@@ -936,7 +936,7 @@ def qwen_size(ratio: str, megapixels: float) -> tuple[int, int]:
 
 def qwen_settings(s: dict) -> dict:
     """Normalise the user's qwen_* settings into a flat dict with defaults."""
-    quality = s.get("qwen_quality") if s.get("qwen_quality") in QWEN_QUALITY_PRESETS else "turbo"
+    quality = s.get("qwen_quality") if s.get("qwen_quality") in QWEN_QUALITY_PRESETS else "quality"
     ratio   = s.get("qwen_ratio") if s.get("qwen_ratio") in QWEN_RATIOS else "1:1"
     mp      = float(s.get("qwen_mp") or 1.0)
     if mp not in QWEN_MEGAPIXELS:
@@ -960,10 +960,10 @@ def qwen_settings(s: dict) -> dict:
 
 def qwen_estimate(q: dict) -> float:
     """Rough total seconds for a Qwen job (sampling dominates)."""
-    per_step = _qwen_sec_per_step.get(q["quality"], 12.5) * (q["width"] * q["height"]) / (1024 * 1024)
+    per_step = _qwen_sec_per_step.get(q["quality"], 2.7) * (q["width"] * q["height"]) / (1024 * 1024)
     if q["cfg"] > 1.0:
         per_step *= 2
-    return q["steps"] * per_step + 15
+    return q["steps"] * per_step + 10
 
 
 def _build_workflow_qwen21(prompt: str, q: dict, seed: int,
@@ -1231,7 +1231,7 @@ def sound_settings(s: dict) -> dict:
 
 
 def song_estimate(m: dict) -> float:
-    lm = 0.07 if m["lm"] == "1.7b" else 0.2           # seconds per audio-code token (5 per sec of audio)
+    lm = 0.08 if m["lm"] == "1.7b" else 1.15          # seconds per audio-code token (5 per sec of audio), RTX 3050
     return 25 + (m["duration"] * 5 * lm if m["codes"] else 0) + m["duration"] * 0.1
 
 

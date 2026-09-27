@@ -237,7 +237,7 @@ async def cb_song_pick(call: CallbackQuery, callback_data: MusCB) -> None:
     elif a == "pk_key":
         items, cur, title = [(k, k) for k in cc.SONG_KEYS], m["key"], "🎼 Тональність (major — світло, minor — сумно)"
     else:
-        items = [("off", "⚡ Вимк. — найшвидше"), ("1.7b", "🧠 1.7B — баланс"), ("4b", "🧠🧠 4B — найкраще, довше")]
+        items = [("off", "⚡ Вимк. — найшвидше"), ("1.7b", "🧠 1.7B — баланс"), ("4b", "🧠🧠 4B — глибше, але ~6 хв на хвилину треку")]
         cur, title = (m["lm"] if m["codes"] else "off"), "🧠 LLM-аранжування"
     await call.answer()
     await _nav(call, f"<b>{title}</b>", parse_mode="HTML",

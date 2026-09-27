@@ -1,6 +1,6 @@
 services:
   comfyui:
-    image: comfyui-local:latest
+    image: comfyui-local:cu130
     container_name: comfyui
     restart: unless-stopped
     runtime: nvidia
