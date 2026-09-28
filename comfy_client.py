@@ -1,5 +1,7 @@
 import asyncio
 import json
+import logging
+import os
 import time
 import uuid
 from io import BytesIO
@@ -41,6 +43,47 @@ def detect_workflow_hint(name: str) -> str:
     return "sd15"
 
 _CONNECT_TIMEOUT = aiohttp.ClientTimeout(total=10, connect=5)
+log = logging.getLogger(__name__)
+
+# ── cleanup of ComfyUI files once the bot has the result ─────────────────
+# The bot runs on the same host as ComfyUI, so results (output/) and uploaded
+# inputs (input/) are deleted from disk right after they are fetched.
+
+_task_uploads: dict[int, list[str]] = {}
+
+
+def _register_upload(name: str) -> None:
+    task = asyncio.current_task()
+    if task is not None:
+        _task_uploads.setdefault(id(task), []).append(name)
+
+
+def _safe_unlink(base: str, *parts: str) -> None:
+    if not base:
+        return
+    root = os.path.realpath(base)
+    path = os.path.realpath(os.path.join(root, *[p for p in parts if p]))
+    if not path.startswith(root + os.sep):
+        return                                  # never touch anything outside the ComfyUI folder
+    try:
+        os.remove(path)
+    except FileNotFoundError:
+        pass
+    except OSError as e:
+        log.warning("cleanup failed for %s: %s", path, e)
+
+
+async def _cleanup_run(session: aiohttp.ClientSession, prompt_id: Optional[str]) -> None:
+    """Delete this task's uploaded inputs and drop the prompt from ComfyUI history."""
+    task = asyncio.current_task()
+    for name in _task_uploads.pop(id(task), []) if task is not None else []:
+        _safe_unlink(config.COMFY_INPUT_DIR, name)
+    if prompt_id:
+        try:
+            await session.post(f"{config.COMFY_URL}/history", json={"delete": [prompt_id]},
+                               timeout=_CONNECT_TIMEOUT)
+        except Exception:
+            pass
 
 
 def _resize(data: bytes, width: int, height: int) -> bytes:
@@ -58,7 +101,9 @@ async def upload_image(image_bytes: bytes, filename: str = "input.png") -> str:
         form.add_field("overwrite", "true")
         r = await session.post(f"{config.COMFY_URL}/upload/image", data=form)
         r.raise_for_status()
-        return (await r.json())["name"]
+        name = (await r.json())["name"]
+        _register_upload(name)
+        return name
 
 
 def _lora_nodes(s: dict) -> tuple[dict, list, list]:
@@ -1141,7 +1186,9 @@ async def run_workflow_rich(
                             r.raise_for_status()
                             state["done_sec_per_step"] = state["sec_per_step"]
                             run_workflow_rich.last_state = dict(state)
-                            return await r.read()
+                            data = await r.read()
+                            _safe_unlink(config.COMFY_OUTPUT_DIR, item.get("subfolder", ""), item["filename"])
+                            return data
 
                     elif etype == "execution_error":
                         raise RuntimeError(f"ComfyUI: {edata.get('exception_message', 'execution error')}")
@@ -1150,6 +1197,7 @@ async def run_workflow_rich(
                         raise RuntimeError("ComfyUI: генерацію перервано")
             finally:
                 hb.cancel()
+                await _cleanup_run(session, prompt_id)
             if marks.get("gone"):
                 raise RuntimeError("ComfyUI: генерацію перервано")
             raise RuntimeError("WebSocket closed unexpectedly")
@@ -1390,7 +1438,9 @@ async def _upload_audio(data: bytes, name: str) -> str:
         form.add_field("overwrite", "true")
         r = await session.post(f"{config.COMFY_URL}/upload/image", data=form)
         r.raise_for_status()
-        return (await r.json())["name"]
+        name = (await r.json())["name"]
+        _register_upload(name)
+        return name
 
 
 async def generate_speech(

@@ -35,3 +35,7 @@ ACE_UNET: str = os.getenv("ACE_UNET", "acestep_v1.5_turbo.safetensors")
 ACE_CLIP: str = os.getenv("ACE_CLIP", "qwen_0.6b_ace15.safetensors")
 ACE_VAE: str = os.getenv("ACE_VAE", "ace_1.5_vae.safetensors")
 SA3_CLIP: str = os.getenv("SA3_CLIP", "t5gemma_b_b_ul2.safetensors")
+
+# ComfyUI folders on this host: results and uploads are deleted once the bot has them ("" disables)
+COMFY_OUTPUT_DIR: str = os.getenv("COMFY_OUTPUT_DIR", "/mnt/docker/comfyui/output")
+COMFY_INPUT_DIR: str = os.getenv("COMFY_INPUT_DIR", "/mnt/docker/comfyui/input")
