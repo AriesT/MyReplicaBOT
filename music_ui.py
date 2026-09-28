@@ -523,6 +523,10 @@ def _progress_text(info: dict, st: dict) -> str:
     cur    = st["stage"] if st["stage"] in order else ("decode" if st["stage"] == "save" else None)
     head   = "🎤 <b>Створюю пісню</b>" if info["kind"] == "song" else "🔊 <b>Створюю звук</b>"
     lines  = [f"{head} · {info['summary']}", f"📝 <i>{_esc(info['label'][:150])}</i>", ""]
+    if st["stage"] == "queue":
+        ahead = st.get("comfy_ahead") or 0
+        lines.append("🕐 <b>Чекаю вільну відеокарту</b>"
+                     + (f" — попереду {ahead} {gq._inflect(ahead)}" if ahead else "…"))
     for key, label in stages:
         if cur is None or order.index(key) > order.index(cur):
             icon = "▫️"
@@ -543,7 +547,7 @@ def _progress_text(info: dict, st: dict) -> str:
     filled = int(round(16 * frac))
     lines += ["", f"🎚 <code>{eq}</code>",
               f"<code>{'▰' * filled}{'▱' * (16 - filled)}  {int(frac * 100)}%</code>",
-              f"⏱ {_fmt(st['elapsed'])} · залишилось ~{_fmt(max(0.0, info['eta'] - st['elapsed']))}"]
+              f"⏱ {_fmt(st['elapsed'])} · залишилось ~{_fmt(st['eta'] if st['stage'] != 'queue' else info['eta'])}"]
     return "\n".join(lines)
 
 
@@ -589,9 +593,11 @@ async def _enqueue(message: Message, user, info: dict) -> None:
     async def _noop(*_a) -> None:
         return None
 
+    kind = "🎤 Пісня" if info["kind"] == "song" else "🔊 Звук"
     await gq.enqueue(gq.GenJob(message=message, prompt=info["label"], user_settings={},
                                status_msg=status, on_done=_noop, on_error=_noop,
-                               cancel_kb=cancel_kb, on_cancel=on_cancel, runner=runner))
+                               cancel_kb=cancel_kb, on_cancel=on_cancel, runner=runner,
+                               label=f"{kind} · {info['summary']}", eta=info["eta"]))
 
 
 async def _run(job: gq.GenJob, info: dict, user) -> None:
@@ -602,12 +608,13 @@ async def _run(job: gq.GenJob, info: dict, user) -> None:
     last = [0.0]
 
     async def on_status(st: dict) -> None:
+        if st.get("prompt_id"):
+            _running["prompt_id"] = st["prompt_id"]
+        gq.report(job, _frac(info, st), st.get("eta"))
         now = time.monotonic()
         if now - last[0] < 2.0:
             return
         last[0] = now
-        if st.get("eta") and st["stage"] == "sample":
-            info["eta"] = st["elapsed"] + st["eta"]
         try:
             await status.edit_text(_progress_text(info, st), parse_mode="HTML", reply_markup=stop_kb)
         except TelegramBadRequest:
@@ -749,5 +756,5 @@ async def cb_stop(call: CallbackQuery, callback_data: MusCB) -> None:
     if _running.get("uid") != call.from_user.id and not admin:
         await call.answer("⛔ Це не ваша генерація.", show_alert=True)
         return
-    await cc.interrupt()
+    await cc.interrupt(_running.get("prompt_id"))
     await call.answer("⏹ Зупиняю…")

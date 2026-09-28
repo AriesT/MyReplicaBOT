@@ -2374,6 +2374,13 @@ async def _do_generate(
         if remaining[0] == 0:
             await _finalize(msg)
 
+    _wf       = user_settings.get("_workflow_type", "sd15")
+    _job_eta  = {"sd15": 15, "sdxl": 50, "flux": 150, "sd3": 60, "hidream": 900}.get(_wf, 60) * (
+                    2 if user_settings.get("hires_fix") else 1)
+    _job_label = f"🎨 {_label(_ckpt, models_db.labels())}" + (" · img2img" if input_image else "")
+    if batch_size > 1:
+        _job_label += f" ×{batch_size}"
+
     ahead = gq.queue_len()
     if ahead == 0:
         status_text = "⏳ Підключаюсь до ComfyUI..."
@@ -2406,6 +2413,8 @@ async def _do_generate(
             batch_total=batch_size,
             cancel_kb=cancel_kb,
             on_cancel=on_cancel,
+            label=_job_label,
+            eta=_job_eta,
         ))
 
 # ── вибір стилю перед генерацією ─────────────────────────────────────────

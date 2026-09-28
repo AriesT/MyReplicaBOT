@@ -529,6 +529,9 @@ async def generate(
         message=message, prompt=en_prompt, user_settings={}, status_msg=status,
         on_done=_noop, on_error=_noop, input_image=input_image,
         cancel_kb=cancel_kb, on_cancel=on_cancel, runner=runner,
+        label=f"🌀 Qwen · {cc.QWEN_QUALITY_PRESETS[q['quality']]['label']}"
+              + (" · редагування" if input_image is not None else ""),
+        eta=eta,
     ))
 
 
@@ -558,6 +561,10 @@ def _progress_caption(info: dict, st: dict) -> str:
     order = [k for k, _ in _STAGES]
     cur   = st["stage"] if st["stage"] in order else ("decode" if st["stage"] == "save" else None)
     lines = [f"{TITLE} · {pre['label']} · {mode}", f"📝 <i>{_esc(short)}</i>", ""]
+    if st["stage"] == "queue":
+        ahead = st.get("comfy_ahead") or 0
+        lines.append("🕐 <b>Чекаю вільну відеокарту</b>"
+                     + (f" — попереду {ahead} {gq._inflect(ahead)}" if ahead else "…"))
     for key, label in _STAGES:
         if cur is None or order.index(key) > order.index(cur):
             icon = "▫️"
@@ -639,6 +646,9 @@ async def _run_job(job: gq.GenJob, info: dict) -> None:
     last_prev  = [None]
 
     async def on_status(st: dict) -> None:
+        if st.get("prompt_id"):
+            _running["prompt_id"] = st["prompt_id"]
+        gq.report(job, _overall(st), st.get("eta"))
         now = time.monotonic()
         new_preview = st["preview"] is not None and st["preview"] is not last_prev[0]
         caption = _progress_caption(info, st)
@@ -807,5 +817,5 @@ async def cb_stop(call: CallbackQuery, callback_data: QwenCB) -> None:
     if _running.get("uid") != call.from_user.id and not admin:
         await call.answer("⛔ Це не ваша генерація.", show_alert=True)
         return
-    await cc.interrupt()
+    await cc.interrupt(_running.get("prompt_id"))
     await call.answer("⏹ Зупиняю…")

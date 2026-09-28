@@ -546,59 +546,23 @@ async def _run_comfy_workflow(
     steps_hint: int = 20,
     poll_timeout: Optional[float] = None,
 ) -> bytes:
-    """Submit a workflow to ComfyUI via WebSocket, wait for output, return bytes."""
-    client_id = str(uuid.uuid4())
-    ws_url    = config.COMFY_URL.replace("http://", "ws://").replace("https://", "wss://")
-    last_upd  = 0.0
-    timeout   = poll_timeout or config.POLL_TIMEOUT
+    """Submit a workflow and return the first output image (legacy SD/FLUX/HiDream/LTX paths).
 
-    async with aiohttp.ClientSession() as session:
-        async with session.ws_connect(
-            f"{ws_url}/ws?clientId={client_id}",
-            timeout=aiohttp.ClientTimeout(total=timeout),
-        ) as ws:
-            resp = await session.post(
-                f"{config.COMFY_URL}/prompt",
-                json={"prompt": workflow, "client_id": client_id},
-            )
-            if not resp.ok:
-                raise RuntimeError(f"ComfyUI {resp.status}: {await resp.text()}")
-            prompt_id: str = (await resp.json())["prompt_id"]
+    Thin adapter over run_workflow_rich(), so legacy jobs also survive interrupts,
+    queue deletions and dropped sockets instead of hanging the bot queue.
+    """
+    last = [0.0]
 
-            async for msg in ws:
-                if msg.type == aiohttp.WSMsgType.TEXT:
-                    event = json.loads(msg.data)
-                    etype = event.get("type")
-                    edata = event.get("data", {})
+    async def on_status(st: dict) -> None:
+        if on_progress is None or not st.get("step"):
+            return
+        now = time.monotonic()
+        if now - last[0] >= 0.8 or st["step"] == st["total"]:
+            last[0] = now
+            await on_progress(st["step"], st["total"])
 
-                    if etype == "progress" and on_progress:
-                        now = time.monotonic()
-                        if now - last_upd >= 0.8:
-                            last_upd = now
-                            try:
-                                await on_progress(edata.get("value", 0), edata.get("max", steps_hint))
-                            except Exception:
-                                pass  # never let a progress callback error break generation
-
-                    elif etype == "executed" and edata.get("prompt_id") == prompt_id:
-                        for img in edata.get("output", {}).get("images", []):
-                            if img.get("type") == "output":
-                                r = await session.get(
-                                    f"{config.COMFY_URL}/view",
-                                    params={"filename": img["filename"],
-                                            "subfolder": img.get("subfolder", ""),
-                                            "type": "output"},
-                                )
-                                r.raise_for_status()
-                                return await r.read()
-
-                    elif etype == "execution_error" and edata.get("prompt_id") == prompt_id:
-                        raise RuntimeError(f"ComfyUI: {edata.get('exception_message', 'execution error')}")
-
-                elif msg.type in (aiohttp.WSMsgType.CLOSED, aiohttp.WSMsgType.ERROR):
-                    raise RuntimeError("WebSocket closed unexpectedly")
-
-    raise RuntimeError("Workflow completed without output image")
+    return await run_workflow_rich(workflow, {}, steps_hint, 0.0, on_status,
+                                   poll_timeout or config.POLL_TIMEOUT, "images")
 
 
 async def generate(
@@ -1027,6 +991,23 @@ def _parse_preview(data: bytes) -> Optional[bytes]:
     return None
 
 
+async def _comfy_ahead(session: aiohttp.ClientSession, prompt_id: str) -> int:
+    """How many prompts ComfyUI will run before ours (running + pending ahead); -1 if gone."""
+    try:
+        r = await session.get(f"{config.COMFY_URL}/queue", timeout=_CONNECT_TIMEOUT)
+        q = await r.json()
+    except Exception:
+        return 0
+    running = [it[1] for it in q.get("queue_running", [])]
+    if prompt_id in running:
+        return 0
+    pending = sorted(q.get("queue_pending", []), key=lambda it: it[0])
+    ids = [it[1] for it in pending]
+    if prompt_id not in ids:
+        return -1                      # not queued any more: finished, or deleted by ⏹
+    return len(running) + ids.index(prompt_id)
+
+
 async def run_workflow_rich(
     workflow: dict,
     stages: dict[str, str],
@@ -1038,18 +1019,19 @@ async def run_workflow_rich(
 ) -> bytes:
     """Submit a workflow and stream rich status until the first output file arrives.
 
-    stages maps node id → stage name. on_status receives a dict: stage, step,
-    total, elapsed, eta, sec_per_step, preview (latest preview JPEG or None),
-    progress_node. Called on every event — throttling is the caller's job.
-    Progress of the "sample" stage drives step/total/eta; progress of any other
-    stage (e.g. an LLM writing audio codes) is reported via stage_step/stage_total.
+    stages maps node id → stage name. on_status receives a dict: stage, step, total,
+    elapsed, eta, sec_per_step, preview (latest preview JPEG or None), stage_step /
+    stage_total (progress of non-sampling nodes, e.g. an LLM), prompt_id and
+    comfy_ahead (prompts ComfyUI runs before ours while we wait). It is called on
+    every event and on a 2 s heartbeat — throttling is the caller's job.
     """
     client_id = str(uuid.uuid4())
     ws_url    = config.COMFY_URL.replace("http://", "ws://").replace("https://", "wss://")
     t0        = time.monotonic()
     state     = {"stage": "queue", "step": 0, "total": steps_hint, "elapsed": 0.0, "eta": eta,
-                 "sec_per_step": None, "preview": None, "stage_step": 0, "stage_total": 0}
-    sample_t0: Optional[float] = None
+                 "sec_per_step": None, "preview": None, "stage_step": 0, "stage_total": 0,
+                 "prompt_id": None, "comfy_ahead": 0}
+    marks     = {"started": None, "sample": None}   # monotonic times of execution / sampling start
 
     async def emit() -> None:
         if on_status is None:
@@ -1059,6 +1041,22 @@ async def run_workflow_rich(
             await on_status(dict(state))
         except Exception:
             pass  # never let a UI error break generation
+
+    async def heartbeat(session: aiohttp.ClientSession, prompt_id: str, ws) -> None:
+        missing = 0
+        while True:
+            await asyncio.sleep(2.0)
+            if state["stage"] == "queue" and marks["started"] is None:
+                ahead = await _comfy_ahead(session, prompt_id)
+                missing = missing + 1 if ahead < 0 else 0
+                if missing >= 2:       # deleted from the queue before it started
+                    marks["gone"] = True
+                    await ws.close()
+                    return
+                state["comfy_ahead"] = max(ahead, 0)
+            elif state["stage"] != "sample" and marks["started"] is not None:
+                state["eta"] = max(3.0, eta - (time.monotonic() - marks["started"]))
+            await emit()
 
     async with aiohttp.ClientSession() as session:
         async with session.ws_connect(
@@ -1071,66 +1069,84 @@ async def run_workflow_rich(
             if not resp.ok:
                 raise RuntimeError(f"ComfyUI {resp.status}: {await resp.text()}")
             prompt_id: str = (await resp.json())["prompt_id"]
+            state["prompt_id"] = prompt_id
+            state["comfy_ahead"] = max(await _comfy_ahead(session, prompt_id), 0)
             await emit()
+            hb = asyncio.create_task(heartbeat(session, prompt_id, ws))
+            try:
+                async for msg in ws:
+                    if msg.type == aiohttp.WSMsgType.BINARY:
+                        img = _parse_preview(msg.data)
+                        if img and state["stage"] == "sample":
+                            state["preview"] = img
+                            await emit()
+                        continue
+                    if msg.type in (aiohttp.WSMsgType.CLOSED, aiohttp.WSMsgType.ERROR):
+                        break
+                    if msg.type != aiohttp.WSMsgType.TEXT:
+                        continue
 
-            async for msg in ws:
-                if msg.type == aiohttp.WSMsgType.BINARY:
-                    img = _parse_preview(msg.data)
-                    if img:
-                        state["preview"] = img
+                    event = json.loads(msg.data)
+                    etype = event.get("type")
+                    edata = event.get("data", {})
+                    if edata.get("prompt_id") != prompt_id and etype != "status":
+                        continue
+
+                    if etype in ("execution_start", "execution_cached") and marks["started"] is None:
+                        marks["started"] = time.monotonic()
+                        if state["stage"] == "queue":
+                            state["stage"] = "load"
                         await emit()
-                    continue
-                if msg.type in (aiohttp.WSMsgType.CLOSED, aiohttp.WSMsgType.ERROR):
-                    raise RuntimeError("WebSocket closed unexpectedly")
-                if msg.type != aiohttp.WSMsgType.TEXT:
-                    continue
 
-                event = json.loads(msg.data)
-                etype = event.get("type")
-                edata = event.get("data", {})
-                if edata.get("prompt_id") not in (None, prompt_id):
-                    continue
+                    elif etype == "executing" and edata.get("node"):
+                        if marks["started"] is None:
+                            marks["started"] = time.monotonic()
+                        stage = stages.get(str(edata["node"]), state["stage"]) if stages else state["stage"]
+                        if stage == "sample" and marks["sample"] is None:
+                            marks["sample"] = time.monotonic()
+                        if stage != state["stage"]:
+                            state["stage_step"] = state["stage_total"] = 0
+                        state["stage"] = stage
+                        await emit()
 
-                if etype == "executing" and edata.get("node"):
-                    stage = stages.get(str(edata["node"]), state["stage"])
-                    if stage == "sample" and sample_t0 is None:
-                        sample_t0 = time.monotonic()
-                    if stage != state["stage"]:
-                        state["stage_step"] = state["stage_total"] = 0
-                    state["stage"] = stage
-                    await emit()
+                    elif etype == "progress":
+                        step, total = edata.get("value", 0), edata.get("max", steps_hint)
+                        if not stages and state["stage"] == "queue":
+                            state["stage"] = "sample"          # legacy callers pass no stage map
+                        if state["stage"] == "sample":
+                            state["step"], state["total"] = step, total
+                            if marks["sample"] is not None and step > 0:
+                                sps = (time.monotonic() - marks["sample"]) / step
+                                state["sec_per_step"] = sps
+                                state["eta"] = sps * (total - step) + 5
+                        else:
+                            state["stage_step"], state["stage_total"] = step, total
+                        await emit()
 
-                elif etype == "progress":
-                    step, total = edata.get("value", 0), edata.get("max", steps_hint)
-                    if state["stage"] == "sample":
-                        state["step"], state["total"] = step, total
-                        if sample_t0 is not None and step > 0:
-                            sps = (time.monotonic() - sample_t0) / step
-                            state["sec_per_step"] = sps
-                            state["eta"] = sps * (total - step) + 5
-                    else:
-                        state["stage_step"], state["stage_total"] = step, total
-                    await emit()
+                    elif etype == "executed":
+                        for item in edata.get("output", {}).get(output_key, []):
+                            if item.get("type") != "output":
+                                continue
+                            r = await session.get(
+                                f"{config.COMFY_URL}/view",
+                                params={"filename": item["filename"],
+                                        "subfolder": item.get("subfolder", ""), "type": "output"},
+                            )
+                            r.raise_for_status()
+                            state["done_sec_per_step"] = state["sec_per_step"]
+                            run_workflow_rich.last_state = dict(state)
+                            return await r.read()
 
-                elif etype == "executed":
-                    for item in edata.get("output", {}).get(output_key, []):
-                        if item.get("type") != "output":
-                            continue
-                        r = await session.get(
-                            f"{config.COMFY_URL}/view",
-                            params={"filename": item["filename"],
-                                    "subfolder": item.get("subfolder", ""), "type": "output"},
-                        )
-                        r.raise_for_status()
-                        state["done_sec_per_step"] = state["sec_per_step"]
-                        run_workflow_rich.last_state = dict(state)
-                        return await r.read()
+                    elif etype == "execution_error":
+                        raise RuntimeError(f"ComfyUI: {edata.get('exception_message', 'execution error')}")
 
-                elif etype == "execution_error":
-                    raise RuntimeError(f"ComfyUI: {edata.get('exception_message', 'execution error')}")
-
-                elif etype == "execution_interrupted":
-                    raise RuntimeError("ComfyUI: генерацію перервано")
+                    elif etype == "execution_interrupted":
+                        raise RuntimeError("ComfyUI: генерацію перервано")
+            finally:
+                hb.cancel()
+            if marks.get("gone"):
+                raise RuntimeError("ComfyUI: генерацію перервано")
+            raise RuntimeError("WebSocket closed unexpectedly")
 
     raise RuntimeError("Workflow completed without output")
 
@@ -1168,14 +1184,17 @@ def _to_png(data: bytes) -> bytes:
     return out.getvalue()
 
 
-async def interrupt() -> None:
+async def interrupt(prompt_id: Optional[str] = None) -> None:
+    """Stop one prompt (running or queued). Without prompt_id — global interrupt."""
     try:
         async with aiohttp.ClientSession(timeout=_CONNECT_TIMEOUT) as s:
-            await s.post(f"{config.COMFY_URL}/interrupt")
+            if prompt_id:
+                await s.post(f"{config.COMFY_URL}/queue", json={"delete": [prompt_id]})
+                await s.post(f"{config.COMFY_URL}/interrupt", json={"prompt_id": prompt_id})
+            else:
+                await s.post(f"{config.COMFY_URL}/interrupt")
     except Exception:
         pass
-
-run_workflow_rich.last_state = {}
 
 
 # ── Music & sound: ACE-Step 1.5 (songs) + Stable Audio 3 (sounds) ────────
