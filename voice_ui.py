@@ -183,22 +183,44 @@ async def cb_cfg(call: CallbackQuery, state: FSMContext) -> None:
     b.button(text=f"🌐 {cc.VOICE_LANGUAGES[m['language']]}", callback_data=VoiceCB(action="pk_lang").pack())
     b.button(text=f"⏩ {m['speed']:g}×",                    callback_data=VoiceCB(action="pk_speed").pack())
     b.button(text=cc.VOICE_QUALITY[m["quality"]][0],         callback_data=VoiceCB(action="pk_q").pack())
+    b.button(text=("🎭 Зміна голосу: з інтонацією" if m["vc_method"] == "intonation"
+                   else "📝 Зміна голосу: через текст"), callback_data=VoiceCB(action="tg_method").pack())
+    b.button(text=f"🎤 Спів: {'так' if m['vc_singing'] else 'ні'}", callback_data=VoiceCB(action="tg_sing").pack())
+    b.button(text=f"🎚 Тон: {m['vc_pitch']:+d}",               callback_data=VoiceCB(action="pk_pitch").pack())
     b.button(text="🔙 Назад",                                 callback_data=VoiceCB(action="menu").pack())
-    b.adjust(3, 1)
+    b.adjust(3, 1, 2, 1)
     await call.answer()
     await _nav(call, "⚙️ <b>Налаштування мовлення</b>\n\n"
                      "🌐 <b>Мова</b> — якою мовою читати текст («Авто» визначає сама).\n"
                      "⏩ <b>Швидкість</b> — темп мовлення.\n"
-                     "💎 <b>Якість</b> — більше кроків = чистіший звук, трохи довше.",
+                     "💎 <b>Якість</b> — більше кроків = чистіший звук, трохи довше.\n\n"
+                     "🔁 <b>Зміна голосу в записі:</b>\n"
+                     "🎭 <b>з інтонацією</b> (Seed-VC) — ваші паузи, емоції, темп, але чужий тембр;\n"
+                     "📝 <b>через текст</b> (OmniVoice) — слова розпізнаються й начитуються наново.\n"
+                     "🎤 <b>Спів</b> — режим для пісень (зберігає мелодію).\n"
+                     "🎚 <b>Тон</b> — зсув у півтонах (напр. +12 / −12 для зміни чоловічий ↔ жіночий у співі).",
                parse_mode="HTML", reply_markup=b.as_markup())
 
 
-@router.callback_query(VoiceCB.filter(F.action.in_({"pk_lang", "pk_speed", "pk_q"})))
+@router.callback_query(VoiceCB.filter(F.action.in_({"tg_method", "tg_sing"})))
+async def cb_toggle_vc(call: CallbackQuery, callback_data: VoiceCB, state: FSMContext) -> None:
+    m = cc.voice_settings(db.get_gen_settings(call.from_user.id))
+    if callback_data.action == "tg_method":
+        db.set_gen_setting(call.from_user.id, "vc_method", "text" if m["vc_method"] == "intonation" else None)
+    else:
+        db.set_gen_setting(call.from_user.id, "vc_singing", not m["vc_singing"])
+    await call.answer("✅")
+    await cb_cfg(call, state)
+
+
+@router.callback_query(VoiceCB.filter(F.action.in_({"pk_lang", "pk_speed", "pk_q", "pk_pitch"})))
 async def cb_pick_cfg(call: CallbackQuery, callback_data: VoiceCB) -> None:
     m = cc.voice_settings(db.get_gen_settings(call.from_user.id))
     a = callback_data.action
     if a == "pk_lang":
         kb = _picker(list(cc.VOICE_LANGUAGES.items()), m["language"], "set_lang")
+    elif a == "pk_pitch":
+        kb = _picker([(str(p), f"{p:+d}") for p in cc.VC_PITCHES], str(m["vc_pitch"]), "set_pitch")
     elif a == "pk_speed":
         kb = _picker([(f"{s:g}", f"{s:g}×") for s in cc.VOICE_SPEEDS], f"{m['speed']:g}", "set_speed")
     else:
@@ -207,10 +229,12 @@ async def cb_pick_cfg(call: CallbackQuery, callback_data: VoiceCB) -> None:
     await _nav(call, "⚙️ Оберіть значення:", reply_markup=kb)
 
 
-@router.callback_query(VoiceCB.filter(F.action.in_({"set_lang", "set_speed", "set_q"})))
+@router.callback_query(VoiceCB.filter(F.action.in_({"set_lang", "set_speed", "set_q", "set_pitch"})))
 async def cb_set_cfg(call: CallbackQuery, callback_data: VoiceCB, state: FSMContext) -> None:
-    key = {"set_lang": "voice_language", "set_speed": "voice_speed", "set_q": "voice_quality"}[callback_data.action]
-    val = float(callback_data.value) if key == "voice_speed" else callback_data.value
+    key = {"set_lang": "voice_language", "set_speed": "voice_speed", "set_q": "voice_quality",
+           "set_pitch": "vc_pitch"}[callback_data.action]
+    val = (float(callback_data.value) if key == "voice_speed"
+           else int(callback_data.value) if key == "vc_pitch" else callback_data.value)
     db.set_gen_setting(call.from_user.id, key, val)
     await call.answer("✅")
     await cb_cfg(call, state)
@@ -398,9 +422,13 @@ async def cb_s2s(call: CallbackQuery, state: FSMContext) -> None:
     await state.set_state(VoiceState.s2s_audio)
     name, _ = _resolve_voice(call.from_user.id)
     await call.answer()
-    await _nav(call, f"🔁 <b>Зміна голосу</b> → {name}\n\n"
-                     "Надішліть голосове повідомлення — бот розпізнає слова й переозвучить їх обраним голосом.\n"
-                     "<i>Голос змінити можна в «🎙 Обрати голос».</i>",
+    m = cc.voice_settings(db.get_gen_settings(call.from_user.id))
+    how = ("🎭 <b>з інтонацією</b> — ваші емоції й паузи збережуться, зміниться лише тембр"
+           + (" · 🎤 режим співу" if m["vc_singing"] else "")) if m["vc_method"] == "intonation" else \
+          "📝 <b>через текст</b> — бот розпізнає слова й начитає їх наново"
+    await _nav(call, f"🔁 <b>Зміна голосу</b> → {name}\n\n{how}\n\n"
+                     "Надішліть голосове повідомлення або аудіо.\n"
+                     "<i>Голос — «🎙 Обрати голос», спосіб — «⚙️ Налаштування».</i>",
                parse_mode="HTML", reply_markup=_kb_back())
 
 
@@ -430,6 +458,8 @@ async def handle_voice_anywhere(message: Message) -> None:
 
 _STAGES = [("load", "Готую голос"), ("encode", "Розпізнаю мову"), ("sample", "Синтезую мовлення"),
            ("save", "Кодую аудіо")]
+_VC_STAGES = [("load", "Завантажую запис"), ("encode", "Створюю зразок голосу"),
+              ("sample", "Перетворюю голос (Seed-VC)"), ("save", "Кодую аудіо")]
 _running: dict = {}
 
 
@@ -449,9 +479,11 @@ def _frac(st: dict) -> float:
 
 
 def _progress_text(info: dict, st: dict) -> str:
-    order = [k for k, _ in _STAGES]
+    stages = _VC_STAGES if info.get("vc") else _STAGES
+    order = [k for k, _ in stages]
     cur = st["stage"] if st["stage"] in order else None
-    head = "🔁 <b>Переозвучую запис</b>" if info["s2s"] else "🔊 <b>Озвучую текст</b>"
+    head = ("🎭 <b>Змінюю голос зі збереженням інтонації</b>" if info.get("vc")
+            else "🔁 <b>Переозвучую запис</b>" if info["s2s"] else "🔊 <b>Озвучую текст</b>")
     lines = [f"{head} · {info['voice_name']}"]
     if info["text"]:
         lines.append(f"📝 <i>{_esc(info['text'][:150])}{'…' if len(info['text']) > 150 else ''}</i>")
@@ -459,8 +491,8 @@ def _progress_text(info: dict, st: dict) -> str:
     if st["stage"] == "queue":
         ahead = st.get("comfy_ahead") or 0
         lines.append("🕐 <b>Чекаю вільну відеокарту</b>" + (f" — попереду {ahead} {gq._inflect(ahead)}" if ahead else "…"))
-    for key, label in _STAGES:
-        if key == "encode" and not info["s2s"]:
+    for key, label in stages:
+        if key == "encode" and (not info["s2s"] or (info.get("vc") and info.get("has_ref"))):
             continue
         if cur is None or order.index(key) > order.index(cur):
             icon = "▫️"
@@ -491,7 +523,11 @@ async def speak(message: Message, user, text: str, source_audio: Optional[bytes]
         m = dict(m, language="auto")
     voice_name, voice = _resolve_voice(user.id)
     eta = cc.voice_estimate(len(text) or 200, m, source_audio is not None)
-    info = {"text": text, "s2s": source_audio is not None, "voice_name": voice_name}
+    vc = source_audio is not None and m["vc_method"] == "intonation"
+    info = {"text": text, "s2s": source_audio is not None, "voice_name": voice_name,
+            "vc": vc, "has_ref": bool(voice.get("ref"))}
+    if vc:
+        eta = 40 if voice.get("ref") else 55
 
     ahead = gq.queue_len()
     status = await message.answer(f"🕐 В черзі — попереду {ahead} {gq._inflect(ahead)}" if ahead
@@ -522,7 +558,11 @@ async def speak(message: Message, user, text: str, source_audio: Optional[bytes]
 
         t0 = time.monotonic()
         try:
-            data, spoken = await cc.generate_speech(text, m, voice, on_status, source_audio)
+            if vc:
+                data = await cc.convert_voice(source_audio, m, voice, on_status)
+                spoken = "🎭 ваш запис зі збереженням інтонації" + (" · 🎤 спів" if m["vc_singing"] else "")
+            else:
+                data, spoken = await cc.generate_speech(text, m, voice, on_status, source_audio)
         except Exception as exc:
             log.exception("speech failed user=%d", user.id)
             err = "⏹ <b>Зупинено</b>" if "перервано" in str(exc) else gq._friendly_error(exc)
@@ -538,7 +578,7 @@ async def speak(message: Message, user, text: str, source_audio: Optional[bytes]
             await status.delete()
         except TelegramBadRequest:
             pass
-        cap = (f"{'🔁' if info['s2s'] else '🔊'} {voice_name} · ⏱ {_fmt(time.monotonic() - t0)}\n"
+        cap = (f"{'🎭' if vc else '🔁' if info['s2s'] else '🔊'} {voice_name} · ⏱ {_fmt(time.monotonic() - t0)}\n"
                f"📝 <i>{_esc(spoken[:700])}{'…' if len(spoken) > 700 else ''}</i>")
         kb = InlineKeyboardBuilder()
         kb.button(text="🎙 Інший голос", callback_data=VoiceCB(action="pick").pack())
@@ -558,7 +598,8 @@ async def speak(message: Message, user, text: str, source_audio: Optional[bytes]
     await gq.enqueue(gq.GenJob(message=message, prompt=text or "speech-to-speech", user_settings={},
                                status_msg=status, on_done=_noop, on_error=_noop, cancel_kb=cancel_kb,
                                on_cancel=on_cancel, runner=runner,
-                               label=("🔁 Переозвучка" if info["s2s"] else "🔊 Озвучка") + f" · {voice_name}",
+                               label=("🎭 Зміна голосу" if vc else "🔁 Переозвучка" if info["s2s"] else "🔊 Озвучка")
+                                     + f" · {voice_name}",
                                eta=eta))
 
 

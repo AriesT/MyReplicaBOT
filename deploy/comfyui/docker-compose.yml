@@ -7,6 +7,7 @@ services:
     environment:
       - NVIDIA_VISIBLE_DEVICES=all
       - NVIDIA_DRIVER_CAPABILITIES=compute,utility
+      - HF_HOME=/app/models/omnivoice
     ports:
       - "8188:8188"
     volumes:
@@ -15,6 +16,8 @@ services:
       - /mnt/docker/comfyui/input:/app/input
       - /mnt/docker/comfyui/user:/app/user
       - /mnt/docker/comfyui/custom_nodes/comfyui_voice:/app/custom_nodes/comfyui_voice:ro
+      - /mnt/docker/comfyui/seed-vc:/opt/seed-vc:ro
+      - /mnt/docker/comfyui/models/seedvc:/app/checkpoints
     command: ["python3","main.py","--listen","0.0.0.0","--port","8188","--preview-method","latent2rgb"]
     logging:
       driver: json-file

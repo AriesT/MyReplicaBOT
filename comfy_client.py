@@ -1352,14 +1352,22 @@ VOICE_PRESETS: dict[str, tuple[str, str, int]] = {
     "whisper":  ("🤫 Шепіт",                "female, young adult, whisper",        5101),
 }
 VOICE_STAGES = {"1": "load", "2": "load", "3": "encode", "4": "sample", "5": "save"}
+VC_PITCHES   = [-12, -7, -4, -2, 0, 2, 4, 7, 12]
+VC_STAGES    = {"2": "load", "1": "encode", "6": "load", "4": "sample", "5": "save"}
+_VC_SAMPLE_TEXT = ("Привіт! Це зразок мого голосу. Я говорю спокійно і рівно, "
+                   "щоб тембр було добре чутно, а інтонація звучала природно.")
 
 
 def voice_settings(s: dict) -> dict:
     lang = s.get("voice_language") if s.get("voice_language") in VOICE_LANGUAGES else "uk"
     spd  = float(s.get("voice_speed") or 1.0)
     ql   = s.get("voice_quality") if s.get("voice_quality") in VOICE_QUALITY else "std"
+    pitch = int(s.get("vc_pitch") or 0)
     return {"language": lang, "speed": spd if spd in VOICE_SPEEDS else 1.0, "quality": ql,
-            "num_step": VOICE_QUALITY[ql][1], "current": s.get("voice_current") or "preset:f_young"}
+            "num_step": VOICE_QUALITY[ql][1], "current": s.get("voice_current") or "preset:f_young",
+            "vc_method": "text" if s.get("vc_method") == "text" else "intonation",
+            "vc_singing": bool(s.get("vc_singing", False)),
+            "vc_pitch": pitch if pitch in VC_PITCHES else 0}
 
 
 def voice_estimate(chars: int, m: dict, s2s: bool = False) -> float:
@@ -1424,3 +1432,34 @@ async def transcribe_audio(data: bytes,
           "3": {"class_type": "OmniVoiceTranscribe", "inputs": {"audio": ["2", 0]}}}
     raw = await run_workflow_rich(wf, VOICE_STAGES, 1, 15, on_status, config.QWEN_POLL_TIMEOUT, "text")
     return raw.decode().strip()
+
+
+async def convert_voice(
+    source_audio: bytes, m: dict, voice: dict,
+    on_status: Optional[Callable[[dict], Awaitable[None]]] = None,
+) -> bytes:
+    """Seed-VC: the same performance (intonation, timing, emotion) in the target voice.
+
+    Target = the cloned voice sample, or — for built-in voices — a sample synthesised by
+    OmniVoice in the same workflow. Returns OGG/Opus bytes.
+    """
+    src = await _upload_audio(source_audio, f"tgbot_vc_{uuid.uuid4().hex[:8]}.ogg")
+    wf: dict = {"2": {"class_type": "LoadAudio", "inputs": {"audio": src}}}
+    if voice.get("ref"):
+        tgt = await _upload_audio(voice["ref"], f"tgbot_vct_{uuid.uuid4().hex[:8]}.ogg")
+        wf["6"] = {"class_type": "LoadAudio", "inputs": {"audio": tgt}}
+        target = ["6", 0]
+    else:
+        wf["1"] = _tts_node(_VC_SAMPLE_TEXT, dict(m, language="uk", speed=1.0), int(voice.get("seed") or 1),
+                            None, "", voice.get("instruct", ""))
+        target = ["1", 0]
+    wf["4"] = {"class_type": "SeedVCConvert",
+               "inputs": {"source": ["2", 0], "target": target,
+                          "mode": "singing" if m["vc_singing"] else "speech",
+                          "diffusion_steps": {"fast": 15, "std": 30, "best": 50}[m["quality"]],
+                          "pitch_shift": m["vc_pitch"], "cfg_rate": 0.7}}
+    wf["5"] = {"class_type": "SaveAudioOpus",
+               "inputs": {"audio": ["4", 0], "filename_prefix": "audio/tgbot_vc", "quality": "128k"}}
+    # source loading and sample synthesis run in arbitrary order: show them as one stage for presets
+    stages = VC_STAGES if voice.get("ref") else dict(VC_STAGES, **{"2": "encode"})
+    return await run_workflow_rich(wf, stages, 1, 45, on_status, config.QWEN_POLL_TIMEOUT, "audio")

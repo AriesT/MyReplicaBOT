@@ -196,11 +196,179 @@ class OmniVoiceTranscribe:
         return {"ui": {"text": [text]}, "result": (text,)}
 
 
+# ── Seed-VC: voice conversion that keeps the source intonation ───────────
+# Seed-VC (GPL-3.0, github.com/Plachtaa/seed-vc) is not vendored: a checkout pinned to a
+# reviewed commit is mounted at SEEDVC_DIR. Its checkpoints are cached in /app/checkpoints.
+
+SEEDVC_DIR = os.environ.get("SEEDVC_DIR", "/opt/seed-vc")
+
+
+def _stub_dac() -> None:
+    """Seed-VC imports dac.nn.quantize.VectorQuantize at module level, but the shipped
+    configs use vector_quantize: false, so it is never instantiated. A stub avoids pulling
+    descript-audio-codec and its heavy dependency tree into the ComfyUI environment."""
+    import sys
+    import types
+    if "dac" in sys.modules:
+        return
+    try:
+        import dac  # noqa: F401  (real package, if someone installed it)
+        return
+    except ImportError:
+        pass
+
+    class VectorQuantize(torch.nn.Module):
+        def __init__(self, *a, **kw):
+            raise RuntimeError("Seed-VC config needs vector quantization: install descript-audio-codec")
+
+    for name in ("dac", "dac.nn", "dac.nn.quantize"):
+        sys.modules[name] = types.ModuleType(name)
+    sys.modules["dac.nn.quantize"].VectorQuantize = VectorQuantize
+
+
+def _patch_bigvgan() -> None:
+    """huggingface_hub>=1.0 no longer passes proxies/resume_download to _from_pretrained,
+    but Seed-VC's bundled BigVGAN declares them as required keyword-only arguments."""
+    import importlib
+    bv = importlib.import_module("modules.bigvgan.bigvgan")
+    cls = bv.BigVGAN
+    if getattr(cls, "_hf_compat_patched", False):
+        return
+    orig = cls.__dict__["_from_pretrained"].__func__
+
+    def _from_pretrained(klass, *args, proxies=None, resume_download=False, **kwargs):
+        return orig(klass, *args, proxies=proxies, resume_download=resume_download, **kwargs)
+
+    cls._from_pretrained = classmethod(_from_pretrained)
+    cls._hf_compat_patched = True
+
+
+_vc = None
+
+
+def _move_vc(wrapper, device) -> None:
+    """Move every torch module the Seed-VC wrapper holds (directly, in dicts, or inside
+    helper objects such as RMVPE) and update the device attributes it reads."""
+    device = torch.device(device)
+    seen: set[int] = set()
+
+    def move(obj, depth=0):
+        if id(obj) in seen or depth > 2:
+            return
+        seen.add(id(obj))
+        if isinstance(obj, torch.nn.Module):
+            obj.to(device)
+        elif isinstance(obj, dict):
+            for v in obj.values():
+                move(v, depth + 1)
+        elif hasattr(obj, "__dict__") and not isinstance(obj, (str, bytes, type)):
+            for k, v in list(vars(obj).items()):
+                if isinstance(v, torch.Tensor):
+                    setattr(obj, k, v.to(device))
+                elif k == "device":
+                    setattr(obj, k, device)
+                else:
+                    move(v, depth + 1)
+
+    move(wrapper)
+
+
+def _seedvc_wrapper():
+    """Seed-VC models are built once, kept in RAM, and moved to the GPU per call."""
+    global _vc
+    if _vc is None:
+        import sys
+        _stub_dac()
+        if SEEDVC_DIR not in sys.path:
+            sys.path.insert(0, SEEDVC_DIR)
+        _patch_bigvgan()
+        from seed_vc_wrapper import SeedVCWrapper
+        _vc = SeedVCWrapper(device=mm.get_torch_device())
+    else:
+        _move_vc(_vc, mm.get_torch_device())
+    return _vc
+
+
+def _drain(result):
+    """convert_voice() is a generator even with stream_output=False: the full audio is its
+    return value (StopIteration.value); streamed items are (mp3_bytes, full_audio)."""
+    import types
+    if not isinstance(result, types.GeneratorType):
+        return result
+    last = None
+    try:
+        while True:
+            item = next(result)
+            if isinstance(item, tuple) and len(item) == 2 and item[1] is not None:
+                last = item[1]
+    except StopIteration as stop:
+        return stop.value if stop.value is not None else last
+
+
+def _write_wav(path: str, wav: torch.Tensor, sr: int) -> None:
+    import soundfile as sf
+    sf.write(path, wav.squeeze(0).numpy(), sr)
+
+
+class SeedVCConvert:
+    """Speech/singing → the same performance in the target voice (zero-shot, any language)."""
+
+    @classmethod
+    def INPUT_TYPES(cls):
+        return {
+            "required": {
+                "source":          ("AUDIO",),
+                "target":          ("AUDIO",),
+                "mode":            (["speech", "singing"], {"default": "speech"}),
+                "diffusion_steps": ("INT", {"default": 30, "min": 4, "max": 100}),
+                "pitch_shift":     ("INT", {"default": 0, "min": -24, "max": 24}),
+                "cfg_rate":        ("FLOAT", {"default": 0.7, "min": 0.0, "max": 1.0, "step": 0.05}),
+            },
+        }
+
+    RETURN_TYPES = ("AUDIO",)
+    FUNCTION = "run"
+    CATEGORY = "audio/omnivoice"
+
+    def run(self, source, target, mode, diffusion_steps, pitch_shift, cfg_rate):
+        import tempfile
+        src, src_sr = _to_mono(source)
+        tgt, tgt_sr = _to_mono(target)
+        tgt = tgt[:, : tgt_sr * 25]            # Seed-VC uses up to ~25 s of reference
+        pbar = comfy.utils.ProgressBar(3)
+        with _lock, tempfile.TemporaryDirectory() as tmp:
+            mm.unload_all_models()
+            mm.soft_empty_cache()
+            sp, tp = os.path.join(tmp, "src.wav"), os.path.join(tmp, "tgt.wav")
+            _write_wav(sp, src, src_sr)
+            _write_wav(tp, tgt, tgt_sr)
+            pbar.update(1)
+            wrapper = _seedvc_wrapper()
+            pbar.update(1)
+            try:
+                singing = mode == "singing"
+                out = wrapper.convert_voice(sp, tp, diffusion_steps=diffusion_steps,
+                                            inference_cfg_rate=cfg_rate, f0_condition=singing,
+                                            auto_f0_adjust=not singing, pitch_shift=pitch_shift,
+                                            stream_output=False)
+                out = _drain(out)
+                sr = 44100 if singing else 22050
+            finally:
+                _move_vc(wrapper, "cpu")
+                del wrapper
+                mm.soft_empty_cache()
+            pbar.update(1)
+        wav = torch.from_numpy(np.asarray(out, dtype=np.float32)).view(1, 1, -1)
+        return ({"waveform": wav, "sample_rate": sr},)
+
+
 NODE_CLASS_MAPPINGS = {
     "OmniVoiceTTS": OmniVoiceTTS,
     "OmniVoiceTranscribe": OmniVoiceTranscribe,
+    "SeedVCConvert": SeedVCConvert,
 }
 NODE_DISPLAY_NAME_MAPPINGS = {
     "OmniVoiceTTS": "OmniVoice TTS / Voice Clone",
     "OmniVoiceTranscribe": "OmniVoice Transcribe (Whisper)",
+    "SeedVCConvert": "Seed-VC Voice Conversion (keeps intonation)",
 }

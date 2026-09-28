@@ -8,7 +8,7 @@ RUN pip install --upgrade pip && pip install torch torchvision torchaudio --inde
 ARG COMFY_REF=master
 RUN git clone https://github.com/comfyanonymous/ComfyUI /app && cd /app && git checkout $COMFY_REF && pip install -r requirements.txt
 # OmniVoice (TTS / voice cloning) for custom_nodes/comfyui_voice. --no-deps keeps ComfyUI's torch/transformers.
-RUN pip install --no-deps omnivoice && pip install pydub librosa soundfile accelerate
+RUN pip install --no-deps omnivoice && pip install pydub librosa soundfile accelerate munch matplotlib
 WORKDIR /app
 EXPOSE 8188
 CMD ["python3","main.py","--listen","0.0.0.0","--port","8188","--preview-method","latent2rgb"]
