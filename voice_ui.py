@@ -1,0 +1,575 @@
+"""
+🗣 Voice section: OmniVoice (600+ languages incl. Ukrainian).
+
+- 🔊 text → speech with a built-in designed voice or a cloned one
+- 🧬 voice cloning from a 5–30 s voice message (consent confirmed first), per-user library
+- 🔁 speech → speech: re-voice a voice message in another voice (Whisper + TTS)
+- "Voice mode": plain text is spoken, voice messages are re-voiced
+"""
+import logging
+import time
+import uuid
+from pathlib import Path
+from typing import Optional
+
+from aiogram import F, Router
+from aiogram.exceptions import TelegramBadRequest
+from aiogram.filters import StateFilter
+from aiogram.filters.callback_data import CallbackData
+from aiogram.fsm.context import FSMContext
+from aiogram.fsm.state import State, StatesGroup
+from aiogram.types import BufferedInputFile, CallbackQuery, InlineKeyboardMarkup, Message
+from aiogram.utils.keyboard import InlineKeyboardBuilder
+
+import comfy_client as cc
+import gen_queue as gq
+import users as db
+
+log    = logging.getLogger(__name__)
+router = Router(name="voice")
+
+TITLE      = "🗣 <b>Голос і мовлення</b>"
+VOICES_DIR = Path(__file__).parent / "voices"
+MAX_VOICES = 12
+MAX_TEXT   = 3000
+
+
+class VoiceCB(CallbackData, prefix="vo"):
+    action: str
+    value:  Optional[str] = None
+
+
+class VoiceState(StatesGroup):
+    tts_text     = State()
+    clone_audio  = State()
+    clone_name   = State()
+    s2s_audio    = State()
+
+
+# ── helpers ───────────────────────────────────────────────────────────────
+
+def _ctx(user) -> tuple[bool, bool]:
+    db.sync_id(user.id, user.username or "")
+    return db.is_allowed(user.id, user.username or ""), db.is_admin(user.id, user.username or "")
+
+
+def _fmt(sec: Optional[float]) -> str:
+    sec = max(0, int(sec or 0))
+    return f"{sec // 60}:{sec % 60:02d}"
+
+
+def _esc(t: str) -> str:
+    return t.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
+
+
+async def _nav(call: CallbackQuery, text: str, **kw) -> None:
+    try:
+        if call.message.voice or call.message.audio or call.message.photo or call.message.document:
+            await call.message.answer(text, **kw)
+        else:
+            await call.message.edit_text(text, **kw)
+    except TelegramBadRequest as e:
+        if "not modified" not in str(e).lower():
+            await call.message.answer(text, **kw)
+
+
+def _kb_back(to: str = "menu") -> InlineKeyboardMarkup:
+    return InlineKeyboardBuilder().button(text="🔙 Назад", callback_data=VoiceCB(action=to).pack()).as_markup()
+
+
+def is_active(tg_id: int) -> bool:
+    return bool(db.get_gen_settings(tg_id).get("voice_active"))
+
+
+# ── voice library (per user, stored in gen_settings + files) ─────────────
+
+def _my_voices(tg_id: int) -> list[dict]:
+    return [v for v in (db.get_gen_settings(tg_id).get("voices") or []) if Path(v.get("file", "")).exists()]
+
+
+def _save_voices(tg_id: int, voices: list[dict]) -> None:
+    db.set_gen_setting(tg_id, "voices", voices or None)
+
+
+def _resolve_voice(tg_id: int, key: Optional[str] = None) -> tuple[str, dict]:
+    """key 'preset:<id>' | 'my:<vid>' → (display name, voice dict for comfy_client)."""
+    key = key or cc.voice_settings(db.get_gen_settings(tg_id))["current"]
+    if key.startswith("my:"):
+        for v in _my_voices(tg_id):
+            if v["id"] == key[3:]:
+                return f"🧬 {v['name']}", {"ref": Path(v["file"]).read_bytes(), "ref_text": v.get("ref_text", ""),
+                                           "seed": 7}
+    pid = key[7:] if key.startswith("preset:") else "f_young"
+    label, instruct, seed = cc.VOICE_PRESETS.get(pid, cc.VOICE_PRESETS["f_young"])
+    return label, {"instruct": instruct, "seed": seed}
+
+
+# ── menu ──────────────────────────────────────────────────────────────────
+
+def _menu_text(tg_id: int) -> str:
+    m = cc.voice_settings(db.get_gen_settings(tg_id))
+    name, _ = _resolve_voice(tg_id)
+    active = is_active(tg_id)
+    return (
+        f"{TITLE}\n<i>OmniVoice · 600+ мов · клонування голосу за 5–30 с запису</i>\n\n"
+        + ("🟢 <b>Режим озвучки увімкнено</b> — текст у чат = мова, голосове = переозвучка.\n\n" if active else "")
+        + f"🎙 Голос: <b>{name}</b>\n"
+        f"🌐 Мова: <b>{cc.VOICE_LANGUAGES[m['language']]}</b> · ⏩ Швидкість: <b>{m['speed']:g}×</b> · "
+        f"{cc.VOICE_QUALITY[m['quality']][0]}\n"
+        f"📚 Моїх голосів: <b>{len(_my_voices(tg_id))}</b>"
+    )
+
+
+def kb_menu(tg_id: int) -> InlineKeyboardMarkup:
+    b = InlineKeyboardBuilder()
+    b.button(text="🔊 Озвучити текст",          callback_data=VoiceCB(action="tts").pack())
+    b.button(text="🔁 Змінити голос у записі",  callback_data=VoiceCB(action="s2s").pack())
+    b.button(text="🧬 Клонувати голос",          callback_data=VoiceCB(action="clone").pack())
+    b.button(text="🎙 Обрати голос",             callback_data=VoiceCB(action="pick").pack())
+    b.button(text=("🟢 Режим озвучки: увімк." if is_active(tg_id) else "⚪ Режим озвучки: вимк."),
+             callback_data=VoiceCB(action="toggle").pack())
+    b.button(text="⚙️ Налаштування",             callback_data=VoiceCB(action="cfg").pack())
+    b.button(text="🔙 Головне меню",             callback_data="menu:main")
+    b.adjust(1, 1, 2, 1, 1, 1)
+    return b.as_markup()
+
+
+async def cmd_voice(message: Message, state: FSMContext) -> None:
+    allowed, _ = _ctx(message.from_user)
+    if not allowed:
+        await message.answer("⛔ У вас немає доступу до цього бота.")
+        return
+    await state.clear()
+    await message.answer(_menu_text(message.from_user.id), parse_mode="HTML",
+                         reply_markup=kb_menu(message.from_user.id))
+
+
+@router.callback_query(VoiceCB.filter(F.action == "menu"))
+async def cb_menu(call: CallbackQuery, state: FSMContext) -> None:
+    allowed, _ = _ctx(call.from_user)
+    if not allowed:
+        await call.answer("⛔", show_alert=True); return
+    await state.clear()
+    await call.answer()
+    await _nav(call, _menu_text(call.from_user.id), parse_mode="HTML", reply_markup=kb_menu(call.from_user.id))
+
+
+@router.callback_query(VoiceCB.filter(F.action == "toggle"))
+async def cb_toggle(call: CallbackQuery) -> None:
+    on = not is_active(call.from_user.id)
+    db.set_gen_setting(call.from_user.id, "voice_active", True if on else None)
+    if on:   # modes are mutually exclusive
+        db.set_gen_setting(call.from_user.id, "qwen_active", None)
+    await call.answer("🟢 Тепер текст → мова, голосове → переозвучка" if on else "⚪ Режим озвучки вимкнено")
+    await _nav(call, _menu_text(call.from_user.id), parse_mode="HTML", reply_markup=kb_menu(call.from_user.id))
+
+
+# ── settings ──────────────────────────────────────────────────────────────
+
+def _picker(items: list[tuple[str, str]], cur: str, action: str, back: str = "cfg") -> InlineKeyboardMarkup:
+    b = InlineKeyboardBuilder()
+    for v, label in items:
+        b.button(text=f"{label}{' ✅' if v == cur else ''}", callback_data=VoiceCB(action=action, value=v).pack())
+    b.button(text="🔙 Назад", callback_data=VoiceCB(action=back).pack())
+    b.adjust(2)
+    return b.as_markup()
+
+
+@router.callback_query(VoiceCB.filter(F.action == "cfg"))
+async def cb_cfg(call: CallbackQuery, state: FSMContext) -> None:
+    await state.clear()
+    m = cc.voice_settings(db.get_gen_settings(call.from_user.id))
+    b = InlineKeyboardBuilder()
+    b.button(text=f"🌐 {cc.VOICE_LANGUAGES[m['language']]}", callback_data=VoiceCB(action="pk_lang").pack())
+    b.button(text=f"⏩ {m['speed']:g}×",                    callback_data=VoiceCB(action="pk_speed").pack())
+    b.button(text=cc.VOICE_QUALITY[m["quality"]][0],         callback_data=VoiceCB(action="pk_q").pack())
+    b.button(text="🔙 Назад",                                 callback_data=VoiceCB(action="menu").pack())
+    b.adjust(3, 1)
+    await call.answer()
+    await _nav(call, "⚙️ <b>Налаштування мовлення</b>\n\n"
+                     "🌐 <b>Мова</b> — якою мовою читати текст («Авто» визначає сама).\n"
+                     "⏩ <b>Швидкість</b> — темп мовлення.\n"
+                     "💎 <b>Якість</b> — більше кроків = чистіший звук, трохи довше.",
+               parse_mode="HTML", reply_markup=b.as_markup())
+
+
+@router.callback_query(VoiceCB.filter(F.action.in_({"pk_lang", "pk_speed", "pk_q"})))
+async def cb_pick_cfg(call: CallbackQuery, callback_data: VoiceCB) -> None:
+    m = cc.voice_settings(db.get_gen_settings(call.from_user.id))
+    a = callback_data.action
+    if a == "pk_lang":
+        kb = _picker(list(cc.VOICE_LANGUAGES.items()), m["language"], "set_lang")
+    elif a == "pk_speed":
+        kb = _picker([(f"{s:g}", f"{s:g}×") for s in cc.VOICE_SPEEDS], f"{m['speed']:g}", "set_speed")
+    else:
+        kb = _picker([(k, f"{v[0]} ({v[1]} кроків)") for k, v in cc.VOICE_QUALITY.items()], m["quality"], "set_q")
+    await call.answer()
+    await _nav(call, "⚙️ Оберіть значення:", reply_markup=kb)
+
+
+@router.callback_query(VoiceCB.filter(F.action.in_({"set_lang", "set_speed", "set_q"})))
+async def cb_set_cfg(call: CallbackQuery, callback_data: VoiceCB, state: FSMContext) -> None:
+    key = {"set_lang": "voice_language", "set_speed": "voice_speed", "set_q": "voice_quality"}[callback_data.action]
+    val = float(callback_data.value) if key == "voice_speed" else callback_data.value
+    db.set_gen_setting(call.from_user.id, key, val)
+    await call.answer("✅")
+    await cb_cfg(call, state)
+
+
+# ── voice picker / library ────────────────────────────────────────────────
+
+@router.callback_query(VoiceCB.filter(F.action == "pick"))
+async def cb_pick(call: CallbackQuery) -> None:
+    cur = cc.voice_settings(db.get_gen_settings(call.from_user.id))["current"]
+    b = InlineKeyboardBuilder()
+    for pid, (label, _, _) in cc.VOICE_PRESETS.items():
+        k = f"preset:{pid}"
+        b.button(text=f"{label}{' ✅' if k == cur else ''}", callback_data=VoiceCB(action="use", value=k).pack())
+    mine = _my_voices(call.from_user.id)
+    for v in mine:
+        k = f"my:{v['id']}"
+        b.button(text=f"🧬 {v['name']}{' ✅' if k == cur else ''}", callback_data=VoiceCB(action="use", value=k).pack())
+    b.button(text="🎧 Прослухати поточний", callback_data=VoiceCB(action="demo").pack())
+    if mine:
+        b.button(text="🗑 Видалити мій голос", callback_data=VoiceCB(action="del_list").pack())
+    b.button(text="🔙 Назад", callback_data=VoiceCB(action="menu").pack())
+    b.adjust(2)
+    await call.answer()
+    await _nav(call, "🎙 <b>Оберіть голос</b>\n\nВбудовані голоси + 🧬 ваші клоновані.",
+               parse_mode="HTML", reply_markup=b.as_markup())
+
+
+@router.callback_query(VoiceCB.filter(F.action == "use"))
+async def cb_use(call: CallbackQuery, callback_data: VoiceCB) -> None:
+    db.set_gen_setting(call.from_user.id, "voice_current", callback_data.value)
+    name, _ = _resolve_voice(call.from_user.id, callback_data.value)
+    await call.answer(f"✅ {name}")
+    await cb_pick(call)
+
+
+@router.callback_query(VoiceCB.filter(F.action == "demo"))
+async def cb_demo(call: CallbackQuery) -> None:
+    await call.answer("🎧 Генерую зразок…")
+    m = cc.voice_settings(db.get_gen_settings(call.from_user.id))
+    demo = {"uk": "Привіт! Ось так звучить цей голос. Напишіть будь-який текст — і я його озвучу.",
+            "en": "Hi! This is how this voice sounds. Send me any text and I will read it aloud."}
+    await speak(call.message, call.from_user, demo.get(m["language"], demo["uk"]))
+
+
+@router.callback_query(VoiceCB.filter(F.action == "del_list"))
+async def cb_del_list(call: CallbackQuery) -> None:
+    b = InlineKeyboardBuilder()
+    for v in _my_voices(call.from_user.id):
+        b.button(text=f"🗑 {v['name']}", callback_data=VoiceCB(action="del", value=v["id"]).pack())
+    b.button(text="🔙 Назад", callback_data=VoiceCB(action="pick").pack())
+    b.adjust(1)
+    await call.answer()
+    await _nav(call, "🗑 Який голос видалити? (запис-зразок теж буде видалено)", reply_markup=b.as_markup())
+
+
+@router.callback_query(VoiceCB.filter(F.action == "del"))
+async def cb_del(call: CallbackQuery, callback_data: VoiceCB) -> None:
+    uid = call.from_user.id
+    keep = []
+    for v in _my_voices(uid):
+        if v["id"] == callback_data.value:
+            Path(v["file"]).unlink(missing_ok=True)
+        else:
+            keep.append(v)
+    _save_voices(uid, keep)
+    if cc.voice_settings(db.get_gen_settings(uid))["current"] == f"my:{callback_data.value}":
+        db.set_gen_setting(uid, "voice_current", None)
+    await call.answer("🗑 Видалено")
+    await cb_pick(call)
+
+
+# ── cloning ───────────────────────────────────────────────────────────────
+
+@router.callback_query(VoiceCB.filter(F.action == "clone"))
+async def cb_clone(call: CallbackQuery) -> None:
+    if len(_my_voices(call.from_user.id)) >= MAX_VOICES:
+        await call.answer(f"⚠️ Максимум {MAX_VOICES} голосів. Видаліть непотрібний.", show_alert=True)
+        return
+    b = InlineKeyboardBuilder()
+    b.button(text="✅ Це мій голос / маю дозвіл власника", callback_data=VoiceCB(action="clone_ok").pack())
+    b.button(text="🔙 Назад", callback_data=VoiceCB(action="menu").pack())
+    b.adjust(1)
+    await call.answer()
+    await _nav(call,
+               "🧬 <b>Клонування голосу</b>\n\n"
+               "Бот запам'ятає тембр із запису й зможе говорити ним будь-який текст.\n\n"
+               "⚠️ Клонуйте лише <b>власний голос</b> або голос людини, яка <b>дала згоду</b>. "
+               "Імітація чужого голосу без дозволу для обману заборонена.\n\n"
+               "Натисніть, щоб підтвердити:",
+               parse_mode="HTML", reply_markup=b.as_markup())
+
+
+@router.callback_query(VoiceCB.filter(F.action == "clone_ok"))
+async def cb_clone_ok(call: CallbackQuery, state: FSMContext) -> None:
+    await state.set_state(VoiceState.clone_audio)
+    await call.answer()
+    await _nav(call,
+               "🎤 Надішліть <b>голосове повідомлення 5–30 секунд</b> (або аудіофайл).\n\n"
+               "Порада: говоріть рівно, без музики й шуму, звичайним тоном. "
+               "Бот сам розпізнає, що ви сказали.",
+               parse_mode="HTML", reply_markup=_kb_back())
+
+
+async def _download(message: Message) -> Optional[tuple[bytes, float]]:
+    media = message.voice or message.audio or message.document
+    if media is None:
+        return None
+    f = await message.bot.get_file(media.file_id)
+    data = (await message.bot.download_file(f.file_path)).read()
+    return data, float(getattr(media, "duration", 0) or 0)
+
+
+@router.message(VoiceState.clone_audio, F.voice | F.audio | F.document)
+async def handle_clone_audio(message: Message, state: FSMContext) -> None:
+    got = await _download(message)
+    if got is None:
+        return
+    data, dur = got
+    if dur and (dur < 3 or dur > 60):
+        await message.answer("⏱ Потрібен запис 5–30 секунд. Спробуйте ще раз.")
+        return
+    status = await message.answer("🧬 Розпізнаю, що ви сказали…")
+    try:
+        text = await cc.transcribe_audio(data)
+    except Exception as exc:
+        log.exception("clone transcribe failed")
+        await status.edit_text(gq._friendly_error(exc), parse_mode="HTML", reply_markup=_kb_back())
+        await state.clear()
+        return
+    await state.update_data(clone_bytes_path=_stash(message.from_user.id, data), clone_text=text)
+    await state.set_state(VoiceState.clone_name)
+    await status.edit_text(
+        f"✅ Розпізнано:\n<i>«{_esc(text[:500])}»</i>\n\n✍️ Як назвати цей голос? (напр. «Мій голос», «Тато»)",
+        parse_mode="HTML", reply_markup=_kb_back())
+
+
+def _stash(uid: int, data: bytes) -> str:
+    VOICES_DIR.mkdir(exist_ok=True)
+    p = VOICES_DIR / f"{uid}_{uuid.uuid4().hex[:10]}.ogg"
+    p.write_bytes(data)
+    return str(p)
+
+
+@router.message(VoiceState.clone_name, F.text)
+async def handle_clone_name(message: Message, state: FSMContext) -> None:
+    data = await state.get_data()
+    await state.clear()
+    path = data.get("clone_bytes_path")
+    if not path or not Path(path).exists():
+        await message.answer("⚠️ Запис загубився, почніть спочатку.", reply_markup=_kb_back())
+        return
+    uid = message.from_user.id
+    vid = Path(path).stem.split("_", 1)[1]
+    voices = _my_voices(uid) + [{"id": vid, "name": message.text.strip()[:40], "file": path,
+                                  "ref_text": data.get("clone_text", ""), "created": int(time.time())}]
+    _save_voices(uid, voices)
+    db.set_gen_setting(uid, "voice_current", f"my:{vid}")
+    await message.answer(f"🧬 Голос <b>{_esc(message.text.strip()[:40])}</b> збережено й обрано!\n"
+                         "Зараз озвучу ним тестову фразу 👇", parse_mode="HTML")
+    await speak(message, message.from_user,
+                "Привіт! Це мій новий цифровий голос. Тепер я можу озвучити будь-який ваш текст.")
+
+
+# ── TTS & speech-to-speech ────────────────────────────────────────────────
+
+@router.callback_query(VoiceCB.filter(F.action == "tts"))
+async def cb_tts(call: CallbackQuery, state: FSMContext) -> None:
+    await state.set_state(VoiceState.tts_text)
+    name, _ = _resolve_voice(call.from_user.id)
+    await call.answer()
+    await _nav(call, f"🔊 <b>Озвучення</b> · {name}\n\nНадішліть текст (до {MAX_TEXT} символів).\n"
+                     "<i>Порада: розділові знаки = паузи та інтонація.</i>",
+               parse_mode="HTML", reply_markup=_kb_back())
+
+
+@router.message(VoiceState.tts_text, F.text)
+async def handle_tts_text(message: Message, state: FSMContext) -> None:
+    await state.clear()
+    await speak(message, message.from_user, message.text.strip())
+
+
+@router.callback_query(VoiceCB.filter(F.action == "s2s"))
+async def cb_s2s(call: CallbackQuery, state: FSMContext) -> None:
+    await state.set_state(VoiceState.s2s_audio)
+    name, _ = _resolve_voice(call.from_user.id)
+    await call.answer()
+    await _nav(call, f"🔁 <b>Зміна голосу</b> → {name}\n\n"
+                     "Надішліть голосове повідомлення — бот розпізнає слова й переозвучить їх обраним голосом.\n"
+                     "<i>Голос змінити можна в «🎙 Обрати голос».</i>",
+               parse_mode="HTML", reply_markup=_kb_back())
+
+
+@router.message(VoiceState.s2s_audio, F.voice | F.audio | F.document)
+async def handle_s2s(message: Message, state: FSMContext) -> None:
+    await state.clear()
+    got = await _download(message)
+    if got:
+        await speak(message, message.from_user, "", source_audio=got[0])
+
+
+@router.message(StateFilter(None), F.voice | F.audio)
+async def handle_voice_anywhere(message: Message) -> None:
+    allowed, _ = _ctx(message.from_user)
+    if not allowed:
+        return
+    if not is_active(message.from_user.id):
+        await message.answer("🗣 Щоб переозвучити голосове, увімкніть <b>режим озвучки</b> у /voice "
+                             "або натисніть «🔁 Змінити голос у записі».", parse_mode="HTML")
+        return
+    got = await _download(message)
+    if got:
+        await speak(message, message.from_user, "", source_audio=got[0])
+
+
+# ── queue + progress ──────────────────────────────────────────────────────
+
+_STAGES = [("load", "Готую голос"), ("encode", "Розпізнаю мову"), ("sample", "Синтезую мовлення"),
+           ("save", "Кодую аудіо")]
+_running: dict = {}
+
+
+def _frac(st: dict) -> float:
+    s = st["stage"]
+    if s == "load":
+        return 0.1
+    if s == "encode":
+        return 0.25
+    if s == "sample":
+        tot = st.get("stage_total") or st.get("total") or 1
+        done = st.get("stage_step") or st.get("step") or 0
+        return 0.3 + 0.6 * done / tot
+    if s == "save":
+        return 0.95
+    return 0.0
+
+
+def _progress_text(info: dict, st: dict) -> str:
+    order = [k for k, _ in _STAGES]
+    cur = st["stage"] if st["stage"] in order else None
+    head = "🔁 <b>Переозвучую запис</b>" if info["s2s"] else "🔊 <b>Озвучую текст</b>"
+    lines = [f"{head} · {info['voice_name']}"]
+    if info["text"]:
+        lines.append(f"📝 <i>{_esc(info['text'][:150])}{'…' if len(info['text']) > 150 else ''}</i>")
+    lines.append("")
+    if st["stage"] == "queue":
+        ahead = st.get("comfy_ahead") or 0
+        lines.append("🕐 <b>Чекаю вільну відеокарту</b>" + (f" — попереду {ahead} {gq._inflect(ahead)}" if ahead else "…"))
+    for key, label in _STAGES:
+        if key == "encode" and not info["s2s"]:
+            continue
+        if cur is None or order.index(key) > order.index(cur):
+            icon = "▫️"
+        elif key == cur:
+            icon = "🔄"
+        else:
+            icon = "✅"
+        lines.append(f"{icon} {label}")
+    frac = _frac(st)
+    filled = int(round(16 * frac))
+    lines += ["", f"<code>{'▰' * filled}{'▱' * (16 - filled)}  {int(frac * 100)}%</code>",
+              f"⏱ {_fmt(st['elapsed'])} · залишилось ~{_fmt(st.get('eta'))}"]
+    return "\n".join(lines)
+
+
+async def speak(message: Message, user, text: str, source_audio: Optional[bytes] = None) -> None:
+    allowed, _ = _ctx(user)
+    if not allowed:
+        await message.answer("⛔ У вас немає доступу до цього бота.")
+        return
+    if source_audio is None and not text:
+        return
+    if len(text) > MAX_TEXT:
+        await message.answer(f"✂️ Задовгий текст: {len(text)} символів, максимум {MAX_TEXT}.")
+        return
+    m = cc.voice_settings(db.get_gen_settings(user.id))
+    if source_audio is not None:
+        m = dict(m, language="auto")
+    voice_name, voice = _resolve_voice(user.id)
+    eta = cc.voice_estimate(len(text) or 200, m, source_audio is not None)
+    info = {"text": text, "s2s": source_audio is not None, "voice_name": voice_name}
+
+    ahead = gq.queue_len()
+    status = await message.answer(f"🕐 В черзі — попереду {ahead} {gq._inflect(ahead)}" if ahead
+                                  else f"⏳ Готую… <i>(~{_fmt(eta)})</i>", parse_mode="HTML")
+    cancel_kb = (InlineKeyboardBuilder()
+                 .button(text="❌ Відмінити", callback_data=f"cncl:{status.message_id}").as_markup())
+    stop_kb = (InlineKeyboardBuilder()
+               .button(text="⏹ Зупинити", callback_data=VoiceCB(action="stop", value=str(status.message_id)).pack())
+               .as_markup())
+
+    async def runner(job: gq.GenJob) -> None:
+        _running.clear()
+        _running.update({"mid": status.message_id, "uid": user.id})
+        last = [0.0]
+
+        async def on_status(st: dict) -> None:
+            if st.get("prompt_id"):
+                _running["prompt_id"] = st["prompt_id"]
+            gq.report(job, _frac(st), st.get("eta"))
+            now = time.monotonic()
+            if now - last[0] < 1.5:
+                return
+            last[0] = now
+            try:
+                await status.edit_text(_progress_text(info, st), parse_mode="HTML", reply_markup=stop_kb)
+            except TelegramBadRequest:
+                pass
+
+        t0 = time.monotonic()
+        try:
+            data, spoken = await cc.generate_speech(text, m, voice, on_status, source_audio)
+        except Exception as exc:
+            log.exception("speech failed user=%d", user.id)
+            err = "⏹ <b>Зупинено</b>" if "перервано" in str(exc) else gq._friendly_error(exc)
+            try:
+                await status.edit_text(err, parse_mode="HTML", reply_markup=_kb_back())
+            except TelegramBadRequest:
+                pass
+            return
+        finally:
+            _running.clear()
+        db.increment_gen_count(user.id)
+        try:
+            await status.delete()
+        except TelegramBadRequest:
+            pass
+        cap = (f"{'🔁' if info['s2s'] else '🔊'} {voice_name} · ⏱ {_fmt(time.monotonic() - t0)}\n"
+               f"📝 <i>{_esc(spoken[:700])}{'…' if len(spoken) > 700 else ''}</i>")
+        kb = InlineKeyboardBuilder()
+        kb.button(text="🎙 Інший голос", callback_data=VoiceCB(action="pick").pack())
+        kb.button(text="🗣 Меню голосу", callback_data=VoiceCB(action="menu").pack())
+        await message.answer_voice(BufferedInputFile(data, filename="voice.ogg"), caption=cap[:1020],
+                                   parse_mode="HTML", reply_markup=kb.as_markup())
+
+    async def on_cancel(msg: Message) -> None:
+        try:
+            await status.edit_text("❌ Скасовано.", reply_markup=_kb_back())
+        except TelegramBadRequest:
+            pass
+
+    async def _noop(*_a) -> None:
+        return None
+
+    await gq.enqueue(gq.GenJob(message=message, prompt=text or "speech-to-speech", user_settings={},
+                               status_msg=status, on_done=_noop, on_error=_noop, cancel_kb=cancel_kb,
+                               on_cancel=on_cancel, runner=runner,
+                               label=("🔁 Переозвучка" if info["s2s"] else "🔊 Озвучка") + f" · {voice_name}",
+                               eta=eta))
+
+
+@router.callback_query(VoiceCB.filter(F.action == "stop"))
+async def cb_stop(call: CallbackQuery, callback_data: VoiceCB) -> None:
+    _, admin = _ctx(call.from_user)
+    if not _running or str(_running.get("mid")) != callback_data.value:
+        await call.answer("⚠️ Вже завершено.", show_alert=True)
+        return
+    if _running.get("uid") != call.from_user.id and not admin:
+        await call.answer("⛔ Це не ваше завдання.", show_alert=True)
+        return
+    await cc.interrupt(_running.get("prompt_id"))
+    await call.answer("⏹ Зупиняю…")

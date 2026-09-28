@@ -28,6 +28,7 @@ import models as models_db
 import upscale_models as upscale_models_db
 import music_ui
 import qwen_ui
+import voice_ui
 import translator
 import users as db
 
@@ -430,6 +431,7 @@ def kb_main(admin: bool) -> InlineKeyboardMarkup:
     b = InlineKeyboardBuilder()
     b.button(text="🌀 Qwen-Image 2.1 ✨",       callback_data=qwen_ui.QwenCB(action="menu").pack())
     b.button(text="🎵 Музика та звуки",         callback_data=music_ui.MusCB(action="menu").pack())
+    b.button(text="🗣 Голос і озвучка",         callback_data=voice_ui.VoiceCB(action="menu").pack())
     b.button(text="🎨 Згенерувати зображення", callback_data="gen:start")
     b.button(text="🎬 Генерація відео",         callback_data=VideoCB(action="menu").pack())
     b.button(text="📊 Статус ComfyUI",          callback_data="comfy:status")
@@ -438,7 +440,7 @@ def kb_main(admin: bool) -> InlineKeyboardMarkup:
     b.button(text="📜 Історія генерацій",        callback_data=HistoryCB(action="show", uid=0).pack())
     if admin:
         b.button(text="⚙️ Налаштування",        callback_data="menu:settings")
-    b.adjust(2, 1)
+    b.adjust(3, 1)
     return b.as_markup()
 
 def kb_settings() -> InlineKeyboardMarkup:
@@ -1977,6 +1979,11 @@ async def cmd_gen(message: Message, state: FSMContext) -> None:
                              reply_markup=kb_cancel_to_main())
 
 
+@dp.message(Command("voice"))
+async def cmd_voice(message: Message, state: FSMContext) -> None:
+    await voice_ui.cmd_voice(message, state)
+
+
 @dp.message(Command("music"))
 async def cmd_music(message: Message, state: FSMContext) -> None:
     await music_ui.cmd_music(message, state)
@@ -2167,6 +2174,9 @@ async def handle_text(message: Message, state: FSMContext) -> None:
     allowed, _ = _ctx(message.from_user)
     if not allowed:
         await message.answer("⛔ У вас немає доступу до цього бота.")
+        return
+    if voice_ui.is_active(message.from_user.id):
+        await voice_ui.speak(message, message.from_user, message.text.strip())
         return
     if qwen_ui.is_active(message.from_user.id):
         await qwen_ui.generate(message, message.text.strip(), message.from_user)
@@ -5253,6 +5263,7 @@ async def _set_commands() -> None:
         BotCommand(command="start",    description="🏠 Головне меню"),
         BotCommand(command="qwen",     description="🌀 Qwen-Image 2.1"),
         BotCommand(command="music",    description="🎵 Музика та звуки"),
+        BotCommand(command="voice",    description="🗣 Голос, озвучка, клонування"),
         BotCommand(command="gen",      description="🎨 Згенерувати зображення"),
         BotCommand(command="settings", description="🎛 Налаштування генерації"),
         BotCommand(command="history",  description="📜 Моя історія зображень"),
@@ -5278,6 +5289,7 @@ async def main() -> None:
     log.info("Bot started. Model: %s", config.CHECKPOINT)
     dp.include_router(qwen_ui.router)
     dp.include_router(music_ui.router)
+    dp.include_router(voice_ui.router)
     await dp.start_polling(bot)
 
 if __name__ == "__main__":

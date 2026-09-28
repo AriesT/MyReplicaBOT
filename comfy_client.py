@@ -1124,6 +1124,12 @@ async def run_workflow_rich(
                         await emit()
 
                     elif etype == "executed":
+                        texts = edata.get("output", {}).get("text")
+                        if texts:
+                            state["texts"] = list(texts)
+                            if output_key == "text":
+                                run_workflow_rich.last_state = dict(state)
+                                return "\n".join(texts).encode()
                         for item in edata.get("output", {}).get(output_key, []):
                             if item.get("type") != "output":
                                 continue
@@ -1325,3 +1331,96 @@ async def generate_sound(prompt: str, m: dict,
     data = await run_workflow_rich(wf, SOUND_STAGES, 8, sound_estimate(m), on_status,
                                    config.QWEN_POLL_TIMEOUT, "audio")
     return data, seed
+
+
+# ── Voice: OmniVoice TTS / cloning / speech-to-speech (custom node comfyui_voice) ──
+
+VOICE_LANGUAGES = {"auto": "🌐 Авто", "uk": "🇺🇦 Українська", "en": "🇬🇧 English", "pl": "🇵🇱 Polski",
+                   "de": "🇩🇪 Deutsch", "fr": "🇫🇷 Français", "es": "🇪🇸 Español", "it": "🇮🇹 Italiano",
+                   "cs": "🇨🇿 Čeština", "ja": "🇯🇵 日本語", "zh": "🇨🇳 中文"}
+VOICE_SPEEDS    = [0.8, 0.9, 1.0, 1.1, 1.25, 1.5]
+VOICE_QUALITY   = {"fast": ("⚡ Швидко", 16), "std": ("⚖️ Стандарт", 32), "best": ("💎 Найкраще", 48)}
+# built-in designed voices: fixed seed → the same voice every time
+VOICE_PRESETS: dict[str, tuple[str, str, int]] = {
+    "f_young":  ("👩 Жінка, молода",       "female, young adult, moderate pitch", 1101),
+    "f_warm":   ("👩‍🦰 Жінка, низький тембр", "female, middle-aged, low pitch",      1202),
+    "m_young":  ("👨 Чоловік, молодий",     "male, young adult, moderate pitch",   2101),
+    "m_deep":   ("🧔 Чоловік, глибокий",    "male, middle-aged, very low pitch",   2202),
+    "granny":   ("👵 Бабуся",               "female, elderly, moderate pitch",     3101),
+    "grandpa":  ("👴 Дідусь",               "male, elderly, low pitch",            3202),
+    "kid":      ("🧒 Дитина",               "child, high pitch",                   4101),
+    "whisper":  ("🤫 Шепіт",                "female, young adult, whisper",        5101),
+}
+VOICE_STAGES = {"1": "load", "2": "load", "3": "encode", "4": "sample", "5": "save"}
+
+
+def voice_settings(s: dict) -> dict:
+    lang = s.get("voice_language") if s.get("voice_language") in VOICE_LANGUAGES else "uk"
+    spd  = float(s.get("voice_speed") or 1.0)
+    ql   = s.get("voice_quality") if s.get("voice_quality") in VOICE_QUALITY else "std"
+    return {"language": lang, "speed": spd if spd in VOICE_SPEEDS else 1.0, "quality": ql,
+            "num_step": VOICE_QUALITY[ql][1], "current": s.get("voice_current") or "preset:f_young"}
+
+
+def voice_estimate(chars: int, m: dict, s2s: bool = False) -> float:
+    # model move to GPU dominates; synthesis ~0.02-0.05 s per char depending on steps
+    return 12 + chars * 0.012 * m["num_step"] / 32 + (8 if s2s else 0)
+
+
+def _tts_node(text_src, m: dict, seed: int, ref: Optional[list], ref_text: str, instruct: str) -> dict:
+    inputs = {"text": text_src, "language": m["language"], "speed": m["speed"],
+              "num_step": m["num_step"], "seed": seed, "ref_text": ref_text or "", "instruct": instruct or ""}
+    if ref is not None:
+        inputs["ref_audio"] = ref
+    return {"class_type": "OmniVoiceTTS", "inputs": inputs}
+
+
+async def _upload_audio(data: bytes, name: str) -> str:
+    async with aiohttp.ClientSession() as session:
+        form = aiohttp.FormData()
+        form.add_field("image", data, filename=name, content_type="application/octet-stream")
+        form.add_field("overwrite", "true")
+        r = await session.post(f"{config.COMFY_URL}/upload/image", data=form)
+        r.raise_for_status()
+        return (await r.json())["name"]
+
+
+async def generate_speech(
+    text: str, m: dict, voice: dict,
+    on_status: Optional[Callable[[dict], Awaitable[None]]] = None,
+    source_audio: Optional[bytes] = None,
+) -> tuple[bytes, str]:
+    """TTS (text) or speech-to-speech (source_audio). voice: {"ref": bytes|None, "ref_text", "instruct", "seed"}.
+
+    Returns (ogg_opus_bytes, spoken_text). For speech-to-speech spoken_text is the Whisper transcript.
+    """
+    wf: dict = {}
+    ref = None
+    if voice.get("ref"):
+        name = await _upload_audio(voice["ref"], f"tgbot_voice_{uuid.uuid4().hex[:8]}.ogg")
+        wf["1"] = {"class_type": "LoadAudio", "inputs": {"audio": name}}
+        ref = ["1", 0]
+    if source_audio is not None:
+        src = await _upload_audio(source_audio, f"tgbot_s2s_{uuid.uuid4().hex[:8]}.ogg")
+        wf["2"] = {"class_type": "LoadAudio", "inputs": {"audio": src}}
+        wf["3"] = {"class_type": "OmniVoiceTranscribe", "inputs": {"audio": ["2", 0]}}
+        text_src: object = ["3", 0]
+    else:
+        text_src = text
+    seed = int(voice.get("seed") or (uuid.uuid4().int & 0xFFFFFFFF))
+    wf["4"] = _tts_node(text_src, m, seed, ref, voice.get("ref_text", ""), voice.get("instruct", ""))
+    wf["5"] = {"class_type": "SaveAudioOpus",
+               "inputs": {"audio": ["4", 0], "filename_prefix": "audio/tgbot_voice", "quality": "128k"}}
+    eta = voice_estimate(len(text) if text else 200, m, source_audio is not None)
+    data = await run_workflow_rich(wf, VOICE_STAGES, 1, eta, on_status, config.QWEN_POLL_TIMEOUT, "audio")
+    spoken = "\n".join(run_workflow_rich.last_state.get("texts") or []) or text
+    return data, spoken
+
+
+async def transcribe_audio(data: bytes,
+                           on_status: Optional[Callable[[dict], Awaitable[None]]] = None) -> str:
+    name = await _upload_audio(data, f"tgbot_asr_{uuid.uuid4().hex[:8]}.ogg")
+    wf = {"2": {"class_type": "LoadAudio", "inputs": {"audio": name}},
+          "3": {"class_type": "OmniVoiceTranscribe", "inputs": {"audio": ["2", 0]}}}
+    raw = await run_workflow_rich(wf, VOICE_STAGES, 1, 15, on_status, config.QWEN_POLL_TIMEOUT, "text")
+    return raw.decode().strip()

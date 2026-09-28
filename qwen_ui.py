@@ -197,6 +197,8 @@ async def cb_toggle_active(call: CallbackQuery) -> None:
         await call.answer("⛔", show_alert=True); return
     on = not is_active(call.from_user.id)
     db.set_gen_setting(call.from_user.id, "qwen_active", True if on else None)
+    if on:   # modes are mutually exclusive
+        db.set_gen_setting(call.from_user.id, "voice_active", None)
     await _refresh(call, "🟢 Тепер кожен промпт → Qwen" if on else "⚪ Повернулись до звичайних моделей")
 
 
