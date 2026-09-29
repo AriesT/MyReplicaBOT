@@ -1475,6 +1475,8 @@ async def generate_speech(
         text_src = text
     seed = int(voice.get("seed") or (uuid.uuid4().int & 0xFFFFFFFF))
     wf["4"] = _tts_node(text_src, m, seed, ref, voice.get("ref_text", ""), voice.get("instruct", ""))
+    if voice.get("lora"):
+        wf["4"]["inputs"]["lora"] = voice["lora"]
     wf["5"] = {"class_type": "SaveAudioOpus",
                "inputs": {"audio": ["4", 0], "filename_prefix": "audio/tgbot_voice",
                           "quality": _opus_bitrate(len(text or ""))}}
@@ -1534,3 +1536,90 @@ async def select_voice_ref(data: bytes, seconds: float) -> bytes:
           "5": {"class_type": "SaveAudioOpus",
                 "inputs": {"audio": ["4", 0], "filename_prefix": "audio/tgbot_ref", "quality": "128k"}}}
     return await run_workflow_rich(wf, VOICE_STAGES, 1, 10, None, 300, "audio")
+
+
+# ── personal voice model (LoRA finetune of OmniVoice) ─────────────────────
+# Training runs inside the ComfyUI container as a separate process (voice_lora.py).
+
+LORA_HOST_ROOT = os.getenv("VOICE_LORA_HOST_ROOT", "/mnt/docker/comfyui/models/omnivoice")
+LORA_CT_ROOT   = "/app/models/omnivoice"          # the same folder as seen inside the container
+COMFY_CONTAINER = os.getenv("COMFY_CONTAINER", "comfyui")
+
+
+def lora_steps(seconds: float) -> int:
+    return int(min(1500, max(300, seconds * 3)))
+
+
+def lora_estimate(seconds: float) -> float:
+    return 90 + seconds * 0.6 + lora_steps(seconds) * 2.6     # prep + ASR + ~2.6 s/step on RTX 3050
+
+
+async def free_comfy_vram() -> None:
+    try:
+        async with aiohttp.ClientSession(timeout=_CONNECT_TIMEOUT) as s:
+            await s.post(f"{config.COMFY_URL}/free", json={"unload_models": True, "free_memory": True})
+    except Exception:
+        pass
+
+
+async def train_voice_lora(takes: list[bytes], name: str, lang: str,
+                           on_progress: Optional[Callable[[dict], Awaitable[None]]] = None) -> dict:
+    """Finetune a personal voice adapter. Returns {"lora": <container path>, "seconds", "clips", "steps"}."""
+    import shutil
+    data_host = os.path.join(LORA_HOST_ROOT, "lora_data", name)
+    out_ct    = f"{LORA_CT_ROOT}/lora/{name}"
+    shutil.rmtree(data_host, ignore_errors=True)
+    os.makedirs(data_host, exist_ok=True)
+    paths = []
+    for i, blob in enumerate(takes):
+        p = os.path.join(data_host, f"take_{i:02d}.ogg")
+        with open(p, "wb") as f:
+            f.write(blob)
+        paths.append(f"{LORA_CT_ROOT}/lora_data/{name}/take_{i:02d}.ogg")
+    await free_comfy_vram()
+    cmd = ["docker", "exec", COMFY_CONTAINER, "python", "/app/custom_nodes/comfyui_voice/voice_lora.py",
+           "--audio", *paths, "--lang", lang if lang and lang != "auto" else "uk", "--out", out_ct]
+    proc = await asyncio.create_subprocess_exec(*cmd, stdout=asyncio.subprocess.PIPE,
+                                                stderr=asyncio.subprocess.STDOUT)
+    result, tail = None, []
+    try:
+        async for raw in proc.stdout:
+            line = raw.decode(errors="replace").strip()
+            if not line:
+                continue
+            tail = (tail + [line])[-15:]
+            if line.startswith("PROGRESS "):
+                ev = json.loads(line[9:])
+                if ev.get("stage") == "done":
+                    result = ev
+                if on_progress:
+                    try:
+                        await on_progress(ev)
+                    except Exception:
+                        pass
+        rc = await proc.wait()
+    except asyncio.CancelledError:
+        await stop_voice_lora()
+        raise
+    finally:
+        shutil.rmtree(data_host, ignore_errors=True)
+    if rc != 0 or result is None:
+        reason = next((l for l in reversed(tail) if l and not l.startswith("PROGRESS")), f"exit {rc}")
+        raise RuntimeError(f"навчання не вдалося: {reason[:300]}")
+    return {"lora": out_ct, "seconds": result.get("seconds"), "clips": result.get("clips"),
+            "steps": result.get("steps")}
+
+
+async def stop_voice_lora() -> None:
+    proc = await asyncio.create_subprocess_exec("docker", "exec", COMFY_CONTAINER, "pkill", "-f", "voice_lora",
+                                                stdout=asyncio.subprocess.DEVNULL, stderr=asyncio.subprocess.DEVNULL)
+    await proc.wait()
+
+
+def delete_voice_lora(ct_path: str) -> None:
+    import shutil
+    if not ct_path or not ct_path.startswith(f"{LORA_CT_ROOT}/lora/"):
+        return
+    host = os.path.join(LORA_HOST_ROOT, os.path.relpath(ct_path, LORA_CT_ROOT))
+    if os.path.realpath(host).startswith(os.path.realpath(os.path.join(LORA_HOST_ROOT, "lora")) + os.sep):
+        shutil.rmtree(host, ignore_errors=True)

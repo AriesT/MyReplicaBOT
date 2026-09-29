@@ -30,7 +30,38 @@ LANGUAGES = ["auto", "uk", "en", "pl", "de", "fr", "es", "it", "pt", "cs", "sk",
 
 _lock = threading.Lock()
 _model = None
+_peft = None                      # PeftModel wrapper once a personal voice (LoRA) has been used
+_adapters: set[str] = set()
 _prompt_cache: dict[str, object] = {}
+LORA_DIR = os.path.join(CACHE_DIR, "lora")
+
+
+def _adapter_name(path: str) -> str:
+    return "v_" + hashlib.sha1(os.path.realpath(path).encode()).hexdigest()[:12]
+
+
+def _activate_lora(model, path: str):
+    """Load (once) and activate a personal-voice LoRA on top of the shared base model.
+    Returns the OmniVoice module to call generate() on."""
+    global _peft
+    real = os.path.realpath(path)
+    if not real.startswith(os.path.realpath(LORA_DIR) + os.sep) or \
+            not os.path.exists(os.path.join(real, "adapter_config.json")):
+        raise ValueError(f"LoRA adapter not found under {LORA_DIR}: {path}")
+    from peft import PeftModel
+    name = _adapter_name(real)
+    if _peft is None:
+        _peft = PeftModel.from_pretrained(model, real, adapter_name=name)
+        _adapters.add(name)
+    elif name not in _adapters:
+        _peft.load_adapter(real, adapter_name=name)
+        _adapters.add(name)
+    _peft.set_adapter(name)
+    # adapters are trained/saved in fp32; the shared base runs in fp16
+    for n, p in _peft.named_parameters():
+        if p.dtype == torch.float32 and ("lora_" in n or "modules_to_save" in n):
+            p.data = p.data.to(torch.float16)
+    return _peft.base_model.model
 
 
 def _load():
@@ -130,6 +161,8 @@ class OmniVoiceTTS:
                 "ref_audio": ("AUDIO",),
                 "ref_text":  ("STRING", {"multiline": True, "default": ""}),
                 "instruct":  ("STRING", {"multiline": False, "default": ""}),
+                "lora":      ("STRING", {"multiline": False, "default": "",
+                                         "tooltip": "personal voice adapter dir under models/omnivoice/lora"}),
             },
         }
 
@@ -137,17 +170,30 @@ class OmniVoiceTTS:
     FUNCTION = "run"
     CATEGORY = "audio/omnivoice"
 
-    def run(self, text, language, speed, num_step, seed, ref_audio=None, ref_text="", instruct=""):
+    def run(self, text, language, speed, num_step, seed, ref_audio=None, ref_text="", instruct="", lora=""):
         chunks = _chunks(text)
         if not chunks:
             raise ValueError("Empty text")
         pbar = comfy.utils.ProgressBar(len(chunks) + 1)
         lang = None if language == "auto" else language
-        with _OnGPU() as model:
+        with _OnGPU() as base:
+            import contextlib
+            if lora:
+                model = _activate_lora(base, lora)
+                ctx = contextlib.nullcontext()
+            else:
+                model = base
+                ctx = _peft.disable_adapter() if _peft is not None else contextlib.nullcontext()
+            with ctx:
+                return self._generate(model, chunks, lang, speed, num_step, seed, ref_audio, ref_text,
+                                      instruct, pbar, lora)
+
+    def _generate(self, model, chunks, lang, speed, num_step, seed, ref_audio, ref_text, instruct, pbar, lora):
+        if True:
             prompt = None
             if ref_audio is not None:
                 wav, sr = _to_mono(ref_audio)
-                key = _audio_key(wav, sr, ref_text or "")
+                key = _audio_key(wav, sr, (ref_text or "") + "|" + (lora or ""))
                 prompt = _prompt_cache.get(key)
                 if prompt is None:
                     if not ref_text and model._asr_pipe is None:

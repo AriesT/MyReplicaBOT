@@ -45,6 +45,7 @@ class VoiceCB(CallbackData, prefix="vo"):
 
 
 class VoiceState(StatesGroup):
+    lora_collect = State()
     tts_text     = State()
     clone_audio  = State()
     clone_name   = State()
@@ -101,6 +102,10 @@ def _my_voices(tg_id: int) -> list[dict]:
     return [v for v in (db.get_gen_settings(tg_id).get("voices") or []) if Path(v.get("file", "")).exists()]
 
 
+def _voice_label(v: dict) -> str:
+    return f"{'🧠' if v.get('lora') else '🧬'} {v['name']}"
+
+
 def _save_voices(tg_id: int, voices: list[dict]) -> None:
     db.set_gen_setting(tg_id, "voices", voices or None)
 
@@ -112,9 +117,9 @@ def _resolve_voice(tg_id: int, key: Optional[str] = None) -> tuple[str, dict]:
         for v in _my_voices(tg_id):
             if v["id"] == key[3:]:
                 vc = v.get("file_vc")
-                return f"🧬 {v['name']}", {"ref": Path(v["file"]).read_bytes(), "ref_text": v.get("ref_text", ""),
-                                           "ref_vc": Path(vc).read_bytes() if vc and Path(vc).exists() else None,
-                                           "seed": 7}
+                return _voice_label(v), {"ref": Path(v["file"]).read_bytes(), "ref_text": v.get("ref_text", ""),
+                                         "ref_vc": Path(vc).read_bytes() if vc and Path(vc).exists() else None,
+                                         "lora": v.get("lora") or "", "seed": 7}
     pid = key[7:] if key.startswith("preset:") else "f_young"
     label, instruct, seed = cc.VOICE_PRESETS.get(pid, cc.VOICE_PRESETS["f_young"])
     return label, {"instruct": instruct, "seed": seed}
@@ -142,11 +147,12 @@ def kb_menu(tg_id: int) -> InlineKeyboardMarkup:
     b.button(text="🔁 Змінити голос у записі",  callback_data=VoiceCB(action="s2s").pack())
     b.button(text="🧬 Клонувати голос",          callback_data=VoiceCB(action="clone").pack())
     b.button(text="🎙 Обрати голос",             callback_data=VoiceCB(action="pick").pack())
+    b.button(text="🧠 Персональна модель голосу", callback_data=VoiceCB(action="lora").pack())
     b.button(text=("🟢 Режим озвучки: увімк." if is_active(tg_id) else "⚪ Режим озвучки: вимк."),
              callback_data=VoiceCB(action="toggle").pack())
     b.button(text="⚙️ Налаштування",             callback_data=VoiceCB(action="cfg").pack())
     b.button(text="🔙 Головне меню",             callback_data="menu:main")
-    b.adjust(1, 1, 2, 1, 1, 1)
+    b.adjust(1, 1, 2, 1, 1, 1, 1)
     return b.as_markup()
 
 
@@ -268,7 +274,7 @@ async def cb_pick(call: CallbackQuery) -> None:
     mine = _my_voices(call.from_user.id)
     for v in mine:
         k = f"my:{v['id']}"
-        b.button(text=f"🧬 {v['name']}{' ✅' if k == cur else ''}", callback_data=VoiceCB(action="use", value=_cb(k)).pack())
+        b.button(text=f"{_voice_label(v)}{' ✅' if k == cur else ''}", callback_data=VoiceCB(action="use", value=_cb(k)).pack())
     b.button(text="🎧 Прослухати поточний", callback_data=VoiceCB(action="demo").pack())
     if mine:
         b.button(text="🗑 Видалити мій голос", callback_data=VoiceCB(action="del_list").pack())
@@ -317,6 +323,8 @@ async def cb_del(call: CallbackQuery, callback_data: VoiceCB) -> None:
             for field in ("file", "file_vc", "file_full"):
                 if v.get(field):
                     Path(v[field]).unlink(missing_ok=True)
+            if v.get("lora"):
+                cc.delete_voice_lora(v["lora"])
         else:
             keep.append(v)
     _save_voices(uid, keep)
@@ -433,6 +441,8 @@ async def handle_clone_name(message: Message, state: FSMContext) -> None:
     for key, field in (("clone_vc_path", "file_vc"), ("clone_full_path", "file_full")):
         if data.get(key):
             entry[field] = data[key]
+    if data.get("clone_full_path") and data.get("clone_dur"):
+        entry["full_sec"] = int(data["clone_dur"])
     voices = _my_voices(uid) + [entry]
     _save_voices(uid, voices)
     db.set_gen_setting(uid, "voice_current", f"my:{vid}")
@@ -751,3 +761,276 @@ async def cb_stop(call: CallbackQuery, callback_data: VoiceCB) -> None:
         return
     await cc.interrupt(_running.get("prompt_id"))
     await call.answer("⏹ Зупиняю…")
+
+
+# ── 🧠 personal voice model (LoRA finetune) ───────────────────────────────
+
+LORA_MIN_SEC = 60
+LORA_GOOD_SEC = 120
+
+
+def _find_voice(uid: int, vid: str) -> Optional[dict]:
+    return next((v for v in _my_voices(uid) if v["id"] == vid), None)
+
+
+@router.callback_query(VoiceCB.filter(F.action == "lora"))
+async def cb_lora(call: CallbackQuery, state: FSMContext) -> None:
+    await state.clear()
+    mine = _my_voices(call.from_user.id)
+    b = InlineKeyboardBuilder()
+    for v in mine:
+        b.button(text=f"{_voice_label(v)}{'  · навчена' if v.get('lora') else ''}",
+                 callback_data=VoiceCB(action="lora_v", value=v["id"]).pack())
+    b.button(text="🧬 Спершу клонувати голос", callback_data=VoiceCB(action="clone").pack()) if not mine else None
+    b.button(text="🔙 Назад", callback_data=VoiceCB(action="menu").pack())
+    b.adjust(1)
+    await call.answer()
+    await _nav(call,
+               "🧠 <b>Персональна модель голосу</b>\n\n"
+               "Звичайний клон бере лише ~10 с вашого голосу. Персональна модель <b>навчається на кількох хвилинах</b> "
+               "начитки — тембр, манера й вимова звучать значно ближче до оригіналу.\n\n"
+               f"📋 Потрібно: {LORA_MIN_SEC // 60}–5 хв чистої мови (найкраще 2–5 хв), тиха кімната.\n"
+               f"⏱ Навчання займає ~15–30 хв відеокарти; інші генерації в цей час чекають у черзі.\n\n"
+               + ("Оберіть голос:" if mine else "Спершу створіть клон голосу — тоді його можна «донавчити»."),
+               parse_mode="HTML", reply_markup=b.as_markup())
+
+
+def _lora_screen(uid: int, v: dict, takes: list[dict]) -> tuple[str, InlineKeyboardMarkup]:
+    total = sum(t["sec"] for t in takes)
+    status = ("✅ <b>Модель навчена</b>" + (f" на {v.get('lora_sec', '?')} с мови" if v.get("lora_sec") else "")
+              + "\n\n") if v.get("lora") else ""
+    bar_n = int(min(total / 300, 1.0) * 16)
+    text = (f"🧠 <b>Персональна модель · {_esc(v['name'])}</b>\n\n{status}"
+            f"🎙 Зібрано записів: <b>{len(takes)}</b> · <b>{total // 60}:{total % 60:02d}</b> хв\n"
+            f"<code>{'▰' * bar_n}{'▱' * (16 - bar_n)}</code>  (ціль 2–5 хв)\n\n"
+            "Надсилайте голосові або аудіофайли — можна кількома частинами. "
+            "Читайте будь-який текст природно: статтю, книжку, лекцію.")
+    if total >= LORA_MIN_SEC:
+        eta = cc.lora_estimate(total)
+        text += f"\n\n⏱ Навчання на цьому займе ~{_fmt(eta)}."
+        if total < LORA_GOOD_SEC:
+            text += " <i>Ще хвилина-дві запису помітно покращить результат.</i>"
+    b = InlineKeyboardBuilder()
+    if total >= LORA_MIN_SEC:
+        b.button(text=("♻️ Перенавчити" if v.get("lora") else "▶️ Почати навчання"),
+                 callback_data=VoiceCB(action="lora_go", value=v["id"]).pack())
+    if takes:
+        b.button(text="🗑 Скинути записи", callback_data=VoiceCB(action="lora_reset", value=v["id"]).pack())
+    if v.get("lora"):
+        b.button(text="🎧 Прослухати модель", callback_data=VoiceCB(action="lora_demo", value=v["id"]).pack())
+        b.button(text="❌ Видалити модель", callback_data=VoiceCB(action="lora_del", value=v["id"]).pack())
+    b.button(text="🔙 Назад", callback_data=VoiceCB(action="lora").pack())
+    b.adjust(1)
+    return text, b.as_markup()
+
+
+async def _initial_takes(uid: int, v: dict) -> list[dict]:
+    if v.get("file_full") and Path(v["file_full"]).exists():
+        return [{"path": v["file_full"], "sec": int(v.get("full_sec") or 0), "keep": True}]
+    return []
+
+
+@router.callback_query(VoiceCB.filter(F.action == "lora_v"))
+async def cb_lora_voice(call: CallbackQuery, callback_data: VoiceCB, state: FSMContext) -> None:
+    v = _find_voice(call.from_user.id, callback_data.value or "")
+    if v is None:
+        await call.answer("⚠️ Голос не знайдено", show_alert=True); return
+    data = await state.get_data()
+    takes = data.get("lora_takes") if data.get("lora_vid") == v["id"] else None
+    if takes is None:
+        takes = await _initial_takes(call.from_user.id, v)
+    await state.set_state(VoiceState.lora_collect)
+    await state.update_data(lora_vid=v["id"], lora_takes=takes)
+    text, kb = _lora_screen(call.from_user.id, v, takes)
+    await call.answer()
+    await _nav(call, text, parse_mode="HTML", reply_markup=kb)
+
+
+@router.message(VoiceState.lora_collect, F.voice | F.audio | F.document)
+async def handle_lora_take(message: Message, state: FSMContext) -> None:
+    got = await _download(message)
+    if got is None:
+        return
+    blob, dur = got
+    data = await state.get_data()
+    v = _find_voice(message.from_user.id, data.get("lora_vid", ""))
+    if v is None:
+        await state.clear(); return
+    takes = list(data.get("lora_takes") or [])
+    if sum(t["sec"] for t in takes) + dur > 15 * 60:
+        await message.answer("⚠️ Досить — понад 15 хв записів модель не покращить.")
+        return
+    VOICES_DIR.mkdir(exist_ok=True)
+    p = VOICES_DIR / f"{message.from_user.id}_{v['id']}_lora_{uuid.uuid4().hex[:6]}.ogg"
+    p.write_bytes(blob)
+    takes.append({"path": str(p), "sec": int(dur or 0), "keep": False})
+    await state.update_data(lora_takes=takes)
+    text, kb = _lora_screen(message.from_user.id, v, takes)
+    await message.answer(f"✅ Додано {int(dur)} с.\n\n" + text, parse_mode="HTML", reply_markup=kb)
+
+
+@router.callback_query(VoiceCB.filter(F.action == "lora_reset"))
+async def cb_lora_reset(call: CallbackQuery, callback_data: VoiceCB, state: FSMContext) -> None:
+    data = await state.get_data()
+    for t in data.get("lora_takes") or []:
+        if not t.get("keep"):
+            Path(t["path"]).unlink(missing_ok=True)
+    await state.update_data(lora_takes=[])
+    v = _find_voice(call.from_user.id, callback_data.value or "")
+    if v:
+        text, kb = _lora_screen(call.from_user.id, v, [])
+        await call.answer("🗑 Скинуто")
+        await _nav(call, text, parse_mode="HTML", reply_markup=kb)
+
+
+@router.callback_query(VoiceCB.filter(F.action == "lora_del"))
+async def cb_lora_del(call: CallbackQuery, callback_data: VoiceCB, state: FSMContext) -> None:
+    uid = call.from_user.id
+    voices = _my_voices(uid)
+    for v in voices:
+        if v["id"] == callback_data.value and v.get("lora"):
+            cc.delete_voice_lora(v["lora"])
+            for k in ("lora", "lora_sec", "lora_steps"):
+                v.pop(k, None)
+    _save_voices(uid, voices)
+    await call.answer("❌ Модель видалено, лишився звичайний клон")
+    await cb_lora(call, state)
+
+
+@router.callback_query(VoiceCB.filter(F.action == "lora_demo"))
+async def cb_lora_demo(call: CallbackQuery, callback_data: VoiceCB) -> None:
+    db.set_gen_setting(call.from_user.id, "voice_current", f"my:{callback_data.value}")
+    await call.answer("🎧 Генерую зразок…")
+    await speak(call.message, call.from_user,
+                "Привіт! Це моя персональна модель голосу. Вона навчалася на кількох хвилинах мого запису.")
+
+
+_LORA_STAGES = [("segment", "✂️ Нарізаю запис на фрази"), ("asr", "📝 Розпізнаю фрази"),
+                ("tokenize", "🔢 Готую дані для навчання"), ("train", "🧠 Навчаю модель")]
+
+
+def _lora_progress(v: dict, ev: dict, t0: float, eta: float, train_t0: Optional[float]) -> str:
+    order = [k for k, _ in _LORA_STAGES]
+    cur = ev.get("stage", "segment")
+    lines = [f"🧠 <b>Навчаю персональну модель</b> · {_esc(v['name'])}", ""]
+    for key, label in _LORA_STAGES:
+        idx, ci = order.index(key), order.index(cur) if cur in order else len(order)
+        icon = "✅" if idx < ci else "🔄" if idx == ci else "▫️"
+        extra = ""
+        if key == cur and ev.get("total"):
+            extra = f" — {ev.get('step', 0)}/{ev['total']}"
+            if key == "train" and ev.get("loss") is not None:
+                extra += f" · loss {ev['loss']:.2f}"
+        lines.append(f"{icon} {label}{extra}")
+    frac = {"segment": 0.02, "asr": 0.05, "tokenize": 0.12, "done": 1.0}.get(cur, 0.0)
+    if cur == "asr" and ev.get("total"):
+        frac = 0.03 + 0.07 * ev.get("step", 0) / ev["total"]
+    left = max(0.0, eta - (time.monotonic() - t0))
+    if cur == "train" and ev.get("total"):
+        done = ev.get("step", 0) / ev["total"]
+        frac = 0.15 + 0.85 * done
+        if train_t0 and ev.get("step"):
+            per = (time.monotonic() - train_t0) / ev["step"]
+            left = per * (ev["total"] - ev["step"]) + 10
+    filled = int(round(16 * frac))
+    lines += ["", f"<code>{'▰' * filled}{'▱' * (16 - filled)}  {int(frac * 100)}%</code>",
+              f"⏱ {_fmt(time.monotonic() - t0)} · залишилось ~{_fmt(left)}"]
+    return "\n".join(lines)
+
+
+@router.callback_query(VoiceCB.filter(F.action == "lora_go"))
+async def cb_lora_go(call: CallbackQuery, callback_data: VoiceCB, state: FSMContext) -> None:
+    uid, user = call.from_user.id, call.from_user
+    v = _find_voice(uid, callback_data.value or "")
+    data = await state.get_data()
+    takes = list(data.get("lora_takes") or [])
+    total = sum(t["sec"] for t in takes)
+    if v is None or total < LORA_MIN_SEC:
+        await call.answer(f"⚠️ Потрібно щонайменше {LORA_MIN_SEC} с записів", show_alert=True); return
+    await state.clear()
+    await call.answer("🧠 Ставлю навчання в чергу")
+    lang = cc.voice_settings(db.get_gen_settings(uid))["language"]
+    eta = cc.lora_estimate(total)
+    status = await call.message.answer(f"🧠 Навчання в черзі… <i>(~{_fmt(eta)})</i>", parse_mode="HTML")
+    cancel_kb = (InlineKeyboardBuilder()
+                 .button(text="❌ Відмінити", callback_data=f"cncl:{status.message_id}").as_markup())
+    stop_kb = (InlineKeyboardBuilder()
+               .button(text="⏹ Зупинити навчання", callback_data=VoiceCB(action="lora_stop", value=str(status.message_id)).pack())
+               .as_markup())
+    name = f"{uid}_{v['id']}"
+
+    async def runner(job: gq.GenJob) -> None:
+        _running.clear()
+        _running.update({"mid": status.message_id, "uid": uid, "lora": True})
+        t0, marks = time.monotonic(), {"train_t0": None}
+
+        async def on_progress(ev: dict) -> None:
+            if ev.get("stage") == "train" and marks["train_t0"] is None and ev.get("step", 0) == 0:
+                marks["train_t0"] = time.monotonic()
+            frac = {"segment": 0.02, "asr": 0.06, "tokenize": 0.12}.get(ev.get("stage"), 0.15)
+            if ev.get("stage") == "train" and ev.get("total"):
+                frac = 0.15 + 0.85 * ev.get("step", 0) / ev["total"]
+            gq.report(job, frac)
+            body = _lora_progress(v, ev, t0, eta, marks["train_t0"])
+            await tg_throttle.edit(status.chat.id, lambda: status.edit_text(
+                body, parse_mode="HTML", reply_markup=stop_kb), min_interval=5.0)
+
+        try:
+            blobs = [Path(t["path"]).read_bytes() for t in takes if Path(t["path"]).exists()]
+            res = await cc.train_voice_lora(blobs, name, lang, on_progress)
+        except Exception as exc:
+            log.exception("voice lora training failed user=%d", uid)
+            stopped = _running.get("stopped")
+            text = "⏹ <b>Навчання зупинено</b>" if stopped else f"❌ <b>Не вдалося навчити модель</b>\n<code>{_esc(str(exc)[:500])}</code>"
+            try:
+                await status.edit_text(text, parse_mode="HTML", reply_markup=_kb_back("lora"))
+            except TelegramBadRequest:
+                pass
+            return
+        finally:
+            _running.clear()
+            for t in takes:
+                if not t.get("keep"):
+                    Path(t["path"]).unlink(missing_ok=True)
+        voices = _my_voices(uid)
+        for x in voices:
+            if x["id"] == v["id"]:
+                x.update(lora=res["lora"], lora_sec=res.get("seconds"), lora_steps=res.get("steps"))
+        _save_voices(uid, voices)
+        db.set_gen_setting(uid, "voice_current", f"my:{v['id']}")
+        try:
+            await status.edit_text(
+                f"✅ <b>Персональну модель навчено!</b> · {_esc(v['name'])}\n\n"
+                f"📊 {res.get('seconds')} с мови · {res.get('clips')} фраз · {res.get('steps')} кроків · "
+                f"⏱ {_fmt(time.monotonic() - t0)}\n\n"
+                "Тепер цей голос позначено 🧠 і він використовується для озвучки автоматично. "
+                "Нижче — перший зразок 👇", parse_mode="HTML", reply_markup=_kb_back("lora"))
+        except TelegramBadRequest:
+            pass
+        await speak(call.message, user, "Привіт! Це моя персональна модель голосу. "
+                                        "Тепер я звучу набагато ближче до оригіналу.")
+
+    async def on_cancel(msg: Message) -> None:
+        try:
+            await status.edit_text("❌ Навчання скасовано.", reply_markup=_kb_back("lora"))
+        except TelegramBadRequest:
+            pass
+
+    async def _noop(*_a) -> None:
+        return None
+
+    await gq.enqueue(gq.GenJob(message=call.message, prompt="voice lora", user_settings={}, status_msg=status,
+                               on_done=_noop, on_error=_noop, cancel_kb=cancel_kb, on_cancel=on_cancel,
+                               runner=runner, label=f"🧠 Навчання голосу · {v['name']}", eta=eta))
+
+
+@router.callback_query(VoiceCB.filter(F.action == "lora_stop"))
+async def cb_lora_stop(call: CallbackQuery, callback_data: VoiceCB) -> None:
+    _, admin = _ctx(call.from_user)
+    if not _running.get("lora") or str(_running.get("mid")) != callback_data.value:
+        await call.answer("⚠️ Вже завершено.", show_alert=True); return
+    if _running.get("uid") != call.from_user.id and not admin:
+        await call.answer("⛔ Це не ваше навчання.", show_alert=True); return
+    _running["stopped"] = True
+    await cc.stop_voice_lora()
+    await call.answer("⏹ Зупиняю навчання…")
