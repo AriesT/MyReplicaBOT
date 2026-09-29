@@ -77,6 +77,15 @@ def _kb_back(to: str = "menu") -> InlineKeyboardMarkup:
     return InlineKeyboardBuilder().button(text="🔙 Назад", callback_data=VoiceCB(action=to).pack()).as_markup()
 
 
+def _cb(value: str) -> str:
+    """':' is aiogram's CallbackData separator — voice keys like 'preset:x' travel as 'preset.x'."""
+    return value.replace(":", ".", 1)
+
+
+def _uncb(value: Optional[str]) -> str:
+    return (value or "").replace(".", ":", 1)
+
+
 def is_active(tg_id: int) -> bool:
     return bool(db.get_gen_settings(tg_id).get("voice_active"))
 
@@ -248,11 +257,11 @@ async def cb_pick(call: CallbackQuery) -> None:
     b = InlineKeyboardBuilder()
     for pid, (label, _, _) in cc.VOICE_PRESETS.items():
         k = f"preset:{pid}"
-        b.button(text=f"{label}{' ✅' if k == cur else ''}", callback_data=VoiceCB(action="use", value=k).pack())
+        b.button(text=f"{label}{' ✅' if k == cur else ''}", callback_data=VoiceCB(action="use", value=_cb(k)).pack())
     mine = _my_voices(call.from_user.id)
     for v in mine:
         k = f"my:{v['id']}"
-        b.button(text=f"🧬 {v['name']}{' ✅' if k == cur else ''}", callback_data=VoiceCB(action="use", value=k).pack())
+        b.button(text=f"🧬 {v['name']}{' ✅' if k == cur else ''}", callback_data=VoiceCB(action="use", value=_cb(k)).pack())
     b.button(text="🎧 Прослухати поточний", callback_data=VoiceCB(action="demo").pack())
     if mine:
         b.button(text="🗑 Видалити мій голос", callback_data=VoiceCB(action="del_list").pack())
@@ -265,8 +274,9 @@ async def cb_pick(call: CallbackQuery) -> None:
 
 @router.callback_query(VoiceCB.filter(F.action == "use"))
 async def cb_use(call: CallbackQuery, callback_data: VoiceCB) -> None:
-    db.set_gen_setting(call.from_user.id, "voice_current", callback_data.value)
-    name, _ = _resolve_voice(call.from_user.id, callback_data.value)
+    key = _uncb(callback_data.value)
+    db.set_gen_setting(call.from_user.id, "voice_current", key)
+    name, _ = _resolve_voice(call.from_user.id, key)
     await call.answer(f"✅ {name}")
     await cb_pick(call)
 

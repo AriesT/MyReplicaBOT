@@ -236,10 +236,10 @@ async def cb_pick_ratio(call: CallbackQuery) -> None:
     items = []
     for r in cc.QWEN_RATIOS:
         w, h = cc.qwen_size(r, q["mp"])
-        items.append((r, f"{names.get(r, r)}  ({w}×{h})"))
+        items.append((r.replace(":", "x"), f"{names.get(r, r)}  ({w}×{h})"))   # ':' is the callback separator
     await call.answer()
     await _nav(call, "📐 <b>Формат зображення</b>", parse_mode="HTML",
-               reply_markup=_kb_picker(items, q["ratio"], "set_ratio"))
+               reply_markup=_kb_picker(items, q["ratio"].replace(":", "x"), "set_ratio"))
 
 
 @router.callback_query(QwenCB.filter(F.action == "pick_mp"))
@@ -259,7 +259,8 @@ async def cb_set_value(call: CallbackQuery, callback_data: QwenCB) -> None:
     if not allowed:
         await call.answer("⛔", show_alert=True); return
     key = {"set_quality": "qwen_quality", "set_ratio": "qwen_ratio", "set_mp": "qwen_mp"}[callback_data.action]
-    value = float(callback_data.value) if key == "qwen_mp" else callback_data.value
+    value = (float(callback_data.value) if key == "qwen_mp"
+             else callback_data.value.replace("x", ":") if key == "qwen_ratio" else callback_data.value)
     db.set_gen_setting(call.from_user.id, key, value)
     await _refresh(call, "✅ Збережено")
 
