@@ -12,6 +12,7 @@ from aiogram.exceptions import TelegramBadRequest
 from aiogram.types import InlineKeyboardMarkup, Message
 
 import comfy_client
+import tg_throttle
 
 log = logging.getLogger(__name__)
 
@@ -149,15 +150,12 @@ async def _run(job: GenJob) -> None:
     async def on_progress(step: int, total: int) -> None:
         report(job, step / total if total else 0.0)
         bar = comfy_client.progress_bar(step, total)
-        try:
-            await job.status_msg.edit_text(
-                f"⚙️ <b>{counter}Генерую {label}...</b>\n\n"
+        text = (f"⚙️ <b>{counter}Генерую {label}...</b>\n\n"
                 f"<code>{bar}</code>\n"
-                f"Крок {step} з {total}",
-                parse_mode="HTML",
-            )
-        except TelegramBadRequest:
-            pass
+                f"Крок {step} з {total}")
+        await tg_throttle.edit(job.status_msg.chat.id,
+                               lambda: job.status_msg.edit_text(text, parse_mode="HTML"),
+                               force=(step == total))
 
     try:
         result = await comfy_client.generate(
@@ -265,11 +263,10 @@ async def _set_waiting(job: GenJob, ahead: int, force: bool = True) -> None:
     key = id(job)
     if not force and _last_text.get(key) == text:
         return
-    _last_text[key] = text
-    try:
-        await job.status_msg.edit_text(text, parse_mode="HTML", reply_markup=job.cancel_kb)
-    except TelegramBadRequest:
-        pass
+    if await tg_throttle.edit(job.status_msg.chat.id,
+                              lambda: job.status_msg.edit_text(text, parse_mode="HTML", reply_markup=job.cancel_kb),
+                              force=force):
+        _last_text[key] = text
 
 
 def _inflect(n: int) -> str:

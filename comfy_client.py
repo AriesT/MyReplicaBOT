@@ -1418,9 +1418,12 @@ def voice_settings(s: dict) -> dict:
             "vc_pitch": pitch if pitch in VC_PITCHES else 0}
 
 
-def voice_estimate(chars: int, m: dict, s2s: bool = False) -> float:
-    # measured on RTX 3050: ~0.028 s per character at 32 steps (≈35 chars/s), plus model move
-    return 10 + chars * 0.028 * m["num_step"] / 32 + (8 if s2s else 0)
+def voice_estimate(chars: int, m: dict, s2s: bool = False, cloned: bool = False) -> float:
+    # measured on RTX 3050: ~0.028 s per character at 32 steps (≈35 chars/s) with a built-in
+    # voice; a cloned voice prepends its reference to every fragment (≈2.5× slower, measured
+    # on a 43k-character lecture: 79 min at 48 steps)
+    per_char = 0.028 * m["num_step"] / 32 * (2.5 if cloned else 1.0)
+    return 10 + chars * per_char + (8 if s2s else 0)
 
 
 def _opus_bitrate(chars: int) -> str:
@@ -1475,7 +1478,7 @@ async def generate_speech(
     wf["5"] = {"class_type": "SaveAudioOpus",
                "inputs": {"audio": ["4", 0], "filename_prefix": "audio/tgbot_voice",
                           "quality": _opus_bitrate(len(text or ""))}}
-    eta = voice_estimate(len(text) if text else 200, m, source_audio is not None)
+    eta = voice_estimate(len(text) if text else 200, m, source_audio is not None, bool(voice.get("ref")))
     data = await run_workflow_rich(wf, VOICE_STAGES, 1, eta, on_status,
                                    max(config.QWEN_POLL_TIMEOUT, eta * 3), "audio")
     spoken = "\n".join(run_workflow_rich.last_state.get("texts") or []) or text

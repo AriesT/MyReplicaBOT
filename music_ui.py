@@ -24,6 +24,7 @@ from aiogram.utils.keyboard import InlineKeyboardBuilder
 
 import comfy_client as cc
 import gen_queue as gq
+import tg_throttle
 import translator
 import users as db
 
@@ -612,13 +613,12 @@ async def _run(job: gq.GenJob, info: dict, user) -> None:
             _running["prompt_id"] = st["prompt_id"]
         gq.report(job, _frac(info, st), st.get("eta"))
         now = time.monotonic()
-        if now - last[0] < 2.0:
+        if now - last[0] < 3.0:
             return
-        last[0] = now
-        try:
-            await status.edit_text(_progress_text(info, st), parse_mode="HTML", reply_markup=stop_kb)
-        except TelegramBadRequest:
-            pass
+        text = _progress_text(info, st)
+        if await tg_throttle.edit(status.chat.id, lambda: status.edit_text(
+                text, parse_mode="HTML", reply_markup=stop_kb)):
+            last[0] = now
 
     t0 = time.monotonic()
     try:

@@ -23,6 +23,7 @@ from aiogram.utils.keyboard import InlineKeyboardBuilder
 
 import comfy_client as cc
 import gen_queue as gq
+import tg_throttle
 import users as db
 
 log    = logging.getLogger(__name__)
@@ -617,7 +618,7 @@ async def speak(message: Message, user, text: str, source_audio: Optional[bytes]
     if source_audio is not None:
         m = dict(m, language="auto")
     voice_name, voice = _resolve_voice(user.id)
-    eta = cc.voice_estimate(len(text) or 200, m, source_audio is not None)
+    eta = cc.voice_estimate(len(text) or 200, m, source_audio is not None, bool(voice.get("ref")))
     vc = source_audio is not None and m["vc_method"] == "intonation"
     info = {"text": text, "s2s": source_audio is not None, "voice_name": voice_name,
             "vc": vc, "has_ref": bool(voice.get("ref"))}
@@ -628,7 +629,10 @@ async def speak(message: Message, user, text: str, source_audio: Optional[bytes]
         words = len(text.split())
         await message.answer(f"📄 Прийнято {words:,} слів ({len(text):,} символів) ≈ {len(text) // 950} хв аудіо.\n"
                              f"⏱ Генерація триватиме ~{_fmt(eta)} — прогрес за фрагментами буде видно нижче.\n"
-                             "<i>Порада: «⚡ Швидко» в налаштуваннях вдвічі скорочує час.</i>".replace(",", " "),
+                             + ("<i>💎 «Найкраще» для довгого тексту — це ~1.5× довше. "
+                                "«⚖️ Стандарт» звучить майже так само, «⚡ Швидко» — ще вдвічі швидше.</i>"
+                                if m["quality"] == "best" else
+                                "<i>Порада: «⚡ Швидко» в налаштуваннях вдвічі скорочує час.</i>").replace(",", " "),
                              parse_mode="HTML")
     ahead = gq.queue_len()
     status = await message.answer(f"🕐 В черзі — попереду {ahead} {gq._inflect(ahead)}" if ahead
@@ -649,13 +653,14 @@ async def speak(message: Message, user, text: str, source_audio: Optional[bytes]
                 _running["prompt_id"] = st["prompt_id"]
             gq.report(job, _frac(st), st.get("eta"))
             now = time.monotonic()
-            if now - last[0] < 1.5:
+            # long narrations run for many minutes: update less often to stay clear of flood limits
+            interval = 3.0 if len(text) < 5000 else 6.0
+            if now - last[0] < interval:
                 return
-            last[0] = now
-            try:
-                await status.edit_text(_progress_text(info, st), parse_mode="HTML", reply_markup=stop_kb)
-            except TelegramBadRequest:
-                pass
+            body = _progress_text(info, st)
+            if await tg_throttle.edit(status.chat.id, lambda: status.edit_text(
+                    body, parse_mode="HTML", reply_markup=stop_kb), min_interval=interval):
+                last[0] = now
 
         t0 = time.monotonic()
         try:

@@ -30,6 +30,7 @@ from PIL import Image, ImageDraw, ImageFont
 
 import comfy_client as cc
 import gen_queue as gq
+import tg_throttle
 import history as hist
 import translator
 import users as db
@@ -655,20 +656,22 @@ async def _run_job(job: gq.GenJob, info: dict) -> None:
         now = time.monotonic()
         new_preview = st["preview"] is not None and st["preview"] is not last_prev[0]
         caption = _progress_caption(info, st)
-        try:
-            if new_preview and now - last_media[0] >= 4.0:
-                last_media[0] = last_text[0] = now
-                last_prev[0]  = st["preview"]
+        chat = card.chat.id
+        if new_preview and now - last_media[0] >= 5.0:
+            preview = st["preview"]
+
+            async def send_media() -> None:
                 await card.edit_media(
-                    InputMediaPhoto(media=BufferedInputFile(st["preview"], "preview.jpg"),
+                    InputMediaPhoto(media=BufferedInputFile(preview, "preview.jpg"),
                                     caption=caption, parse_mode="HTML"),
-                    reply_markup=stop_kb,
-                )
-            elif now - last_text[0] >= 2.5:
+                    reply_markup=stop_kb)
+            if await tg_throttle.edit(chat, send_media):
+                last_media[0] = last_text[0] = now
+                last_prev[0] = preview
+        elif now - last_text[0] >= 3.0:
+            if await tg_throttle.edit(chat, lambda: card.edit_caption(
+                    caption=caption, parse_mode="HTML", reply_markup=stop_kb)):
                 last_text[0] = now
-                await card.edit_caption(caption=caption, parse_mode="HTML", reply_markup=stop_kb)
-        except TelegramBadRequest:
-            pass
 
     t0 = time.monotonic()
     try:
