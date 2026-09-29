@@ -1551,7 +1551,8 @@ def lora_steps(seconds: float) -> int:
 
 
 def lora_estimate(seconds: float) -> float:
-    return 90 + seconds * 0.6 + lora_steps(seconds) * 2.6     # prep + ASR + ~2.6 s/step on RTX 3050
+    # measured on RTX 3050: 2:45 of speech → 102 s prep (segment/ASR/tokens) + 496 steps in 786 s (≈1.6 s/step)
+    return 60 + seconds * 0.25 + lora_steps(seconds) * 1.6
 
 
 async def free_comfy_vram() -> None:
