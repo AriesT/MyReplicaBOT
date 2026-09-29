@@ -26,6 +26,9 @@ import history as hist
 import loras as loras_db
 import models as models_db
 import upscale_models as upscale_models_db
+import music_ui
+import qwen_ui
+import voice_ui
 import translator
 import users as db
 
@@ -37,7 +40,7 @@ dp  = Dispatcher(storage=MemoryStorage())
 
 # ── presets ───────────────────────────────────────────────────────────────
 
-SIZE_PRESETS    = ["512×512", "768×512", "512×768", "768×768", "1024×1024", "1024×768", "768×1024"]
+SIZE_PRESETS    = ["512×512", "768×512", "512×768", "768×768", "1024×1024", "1024×768", "768×1024", "1280×480"]
 STEPS_PRESETS   = [10, 15, 20, 25, 30, 40]
 CFG_PRESETS     = [4.0, 5.0, 6.0, 7.0, 8.0, 9.0, 11.0]
 SAMPLER_PRESETS = ["euler", "euler_ancestral", "dpmpp_2m", "dpmpp_2m_karras", "ddim", "uni_pc"]
@@ -118,6 +121,15 @@ class RegenConfigState(StatesGroup):
 
 class StylePickState(StatesGroup):
     waiting = State()
+
+class VideoGenState(StatesGroup):
+    waiting_prompt = State()
+
+class VideoImg2VidState(StatesGroup):
+    waiting_photo = State()
+
+class VideoSettingsState(StatesGroup):
+    waiting_neg = State()
 
 # ── callback data ─────────────────────────────────────────────────────────
 
@@ -251,6 +263,10 @@ class MultiLoraCB(CallbackData, prefix="ml"):
     action: str                  # tog | str_pick | str_set | lra_off
     lid:    Optional[str] = None # hashed lora id (≤40 chars)
     val:    Optional[str] = None # strength value for str_set
+
+class VideoCB(CallbackData, prefix="vid"):
+    action: str
+    value:  Optional[str] = None
 
 # ── helpers ───────────────────────────────────────────────────────────────
 
@@ -413,14 +429,18 @@ async def _build_status_text(tg_id: int) -> str:
 
 def kb_main(admin: bool) -> InlineKeyboardMarkup:
     b = InlineKeyboardBuilder()
+    b.button(text="🌀 Qwen-Image 2.1 ✨",       callback_data=qwen_ui.QwenCB(action="menu").pack())
+    b.button(text="🎵 Музика та звуки",         callback_data=music_ui.MusCB(action="menu").pack())
+    b.button(text="🗣 Голос і озвучка",         callback_data=voice_ui.VoiceCB(action="menu").pack())
     b.button(text="🎨 Згенерувати зображення", callback_data="gen:start")
+    b.button(text="🎬 Генерація відео",         callback_data=VideoCB(action="menu").pack())
     b.button(text="📊 Статус ComfyUI",          callback_data="comfy:status")
     b.button(text="🎛 Налаштування генерації",  callback_data=GsCB(action="menu").pack())
     b.button(text="📈 Моя статистика",           callback_data="stats:my")
     b.button(text="📜 Історія генерацій",        callback_data=HistoryCB(action="show", uid=0).pack())
     if admin:
         b.button(text="⚙️ Налаштування",        callback_data="menu:settings")
-    b.adjust(1)
+    b.adjust(3, 1)
     return b.as_markup()
 
 def kb_settings() -> InlineKeyboardMarkup:
@@ -433,11 +453,84 @@ def kb_settings() -> InlineKeyboardMarkup:
     b.button(text="📜 Повна історія",            callback_data=HistoryCB(action="show",     uid=-1).pack())
     b.button(text="🗑 Очистити всю історію",      callback_data=HistoryCB(action="clearall", uid=-1).pack())
     if game_api.is_configured():
-        icon = "🔴 Стоп MMORPG-генерацію" if _game_gen_running() else "🎮 Генерація предметів MMORPG"
-        b.button(text=icon, callback_data="game:gen")
+        b.button(text="🎮 MMORPG ROE", callback_data="game:menu")
     b.button(text="🔙 Головне меню",             callback_data="menu:main")
     b.adjust(1)
     return b.as_markup()
+
+def kb_mmorpg_menu(
+    items_running:         Optional[bool] = None,
+    monsters_running:      Optional[bool] = None,
+    npcs_running:          Optional[bool] = None,
+    locations_running:     Optional[bool] = None,
+    skills_running:        Optional[bool] = None,
+    items_vid_running:     Optional[bool] = None,
+    monsters_vid_running:  Optional[bool] = None,
+    npcs_vid_running:      Optional[bool] = None,
+    locations_vid_running: Optional[bool] = None,
+    skills_vid_running:    Optional[bool] = None,
+) -> InlineKeyboardMarkup:
+    """
+    Two-column layout: left = image gen, right = video gen.
+    Pass explicit False at the end of a task to force the Start button.
+    """
+    def _running(override, check_fn) -> bool:
+        return check_fn() if override is None else override
+
+    b = InlineKeyboardBuilder()
+
+    # Each tuple: (img_running, img_stop_txt, img_stop_cb, img_start_txt, img_start_cb,
+    #              vid_running, vid_stop_txt, vid_stop_cb, vid_start_txt, vid_start_cb)
+    rows = [
+        (
+            _running(items_running,         _game_gen_running),
+            "🔴 ⚔️ Зупинити 🖼",  "game:items_stop",
+            "🖼 ⚔️ Предмети",      "game:items_gen",
+            _running(items_vid_running,     _game_vid_gen_running),
+            "🔴 ⚔️ Зупинити 🎬",  "game:items_vid_stop",
+            "🎬 ⚔️ Предмети",      "game:items_vid_gen",
+        ),
+        (
+            _running(monsters_running,      _game_monster_gen_running),
+            "🔴 👹 Зупинити 🖼",  "game:monsters_stop",
+            "🖼 👹 Монстри",        "game:monsters_gen",
+            _running(monsters_vid_running,  _game_vid_monster_gen_running),
+            "🔴 👹 Зупинити 🎬",  "game:monsters_vid_stop",
+            "🎬 👹 Монстри",        "game:monsters_vid_gen",
+        ),
+        (
+            _running(npcs_running,          _game_npc_gen_running),
+            "🔴 🧙 Зупинити 🖼",  "game:npcs_stop",
+            "🖼 🧙 NPC",            "game:npcs_gen",
+            _running(npcs_vid_running,      _game_vid_npc_gen_running),
+            "🔴 🧙 Зупинити 🎬",  "game:npcs_vid_stop",
+            "🎬 🧙 NPC",            "game:npcs_vid_gen",
+        ),
+        (
+            _running(locations_running,     _game_location_gen_running),
+            "🔴 🗺️ Зупинити 🖼",  "game:locations_stop",
+            "🖼 🗺️ Локації",        "game:locations_gen",
+            _running(locations_vid_running, _game_vid_location_gen_running),
+            "🔴 🗺️ Зупинити 🎬",  "game:locations_vid_stop",
+            "🎬 🗺️ Локації",        "game:locations_vid_gen",
+        ),
+        (
+            _running(skills_running,        _game_skill_gen_running),
+            "🔴 ✨ Зупинити 🖼",  "game:skills_stop",
+            "🖼 ✨ Скіли",          "game:skills_gen",
+            _running(skills_vid_running,    _game_vid_skill_gen_running),
+            "🔴 ✨ Зупинити 🎬",  "game:skills_vid_stop",
+            "🎬 ✨ Скіли",          "game:skills_vid_gen",
+        ),
+    ]
+    for (ir, is_t, is_c, ist_t, ist_c,
+         vr, vs_t, vs_c, vst_t, vst_c) in rows:
+        b.button(text=is_t  if ir else ist_t, callback_data=is_c  if ir else ist_c)
+        b.button(text=vs_t  if vr else vst_t, callback_data=vs_c  if vr else vst_c)
+    b.button(text="🔙 Назад", callback_data="menu:settings")
+    b.adjust(2, 2, 2, 2, 2, 1)
+    return b.as_markup()
+
 
 def kb_users() -> InlineKeyboardMarkup:
     b = InlineKeyboardBuilder()
@@ -1149,6 +1242,668 @@ def kb_comfy_models(available: list[str], existing: list[str]) -> InlineKeyboard
     b.adjust(1)
     return b.as_markup()
 
+# ── video keyboards ──────────────────────────────────────────────────────
+
+def _get_video_settings(tg_id: int) -> dict:
+    s = db.get_gen_settings(tg_id)
+    return {k[6:]: v for k, v in s.items() if k.startswith("video_")}
+
+
+def _video_settings_text(tg_id: int) -> str:
+    s           = db.get_gen_settings(tg_id)
+    model       = s.get("video_model")           or "<i>не обрано</i>"
+    w           = s.get("video_width")           or 480
+    h           = s.get("video_height")          or 288
+    frames      = s.get("video_frames")          or 25
+    fps         = s.get("video_fps")             or 8
+    steps       = s.get("video_steps")           or 25
+    cfg         = s.get("video_cfg")             or 3.5
+    strength    = s.get("video_strength",  1.0)
+    loop        = bool(s.get("video_loop", False))
+    compression = s.get("video_img_compression") or 35
+    neg         = s.get("video_negative")
+    neg_str     = f"<i>{neg[:50]}{'…' if len(neg)>50 else ''}</i>" if neg else "<i>стандартний</i>"
+    has_model   = bool(s.get("video_model"))
+
+    loop_str   = "🔁 <b>увімк.</b>" if loop else "➡️ вимк."
+    comp_label = {0: "без змін", 15: "легка", 35: "стандарт", 50: "середня",
+                  75: "художня"}.get(int(compression), str(compression))
+    return (
+        "🎬 <b>Налаштування генерації відео</b>\n\n"
+        f"🎞 Модель:       {'<b>' + model + '</b>' if has_model else model}\n"
+        f"📐 Розмір:       <b>{w}×{h}</b>\n"
+        f"🎞 Кадри:        <b>{frames}</b>  ({frames/fps:.1f}с при {fps} fps)\n"
+        f"⚡ FPS:          <b>{fps}</b>\n"
+        f"🎚 Кроки:        <b>{steps}</b>\n"
+        f"🎯 CFG:          <b>{cfg}</b>\n"
+        f"🏃 Сила руху:    <b>{strength}</b>\n"
+        f"🔁 Безшовний loop: {loop_str}\n"
+        f"🎨 Препроцесинг: <b>{compression}</b> ({comp_label})\n"
+        f"📝 Негативний:   {neg_str}\n\n"
+        "💡 <i>Для безшовного loop: увімкніть 🔁 + CFG 2.5–3.0 + сила 0.6–0.8\n"
+        "Для RTX 3050 6GB рекомендовано: 480×288, 33 кадри.</i>"
+    )
+
+
+def kb_video_menu(tg_id: int) -> InlineKeyboardMarkup:
+    s    = db.get_gen_settings(tg_id)
+    mode = s.get("video_mode") or "text2video"
+    has_model = bool(s.get("video_model"))
+    b = InlineKeyboardBuilder()
+    if has_model:
+        b.button(text="🖋 Текст → Відео",     callback_data=VideoCB(action="t2v").pack())
+        b.button(text="🖼 Зображення → Відео", callback_data=VideoCB(action="i2v").pack())
+    else:
+        b.button(text="⚠️ Спочатку оберіть модель ↓", callback_data=VideoCB(action="settings").pack())
+    b.button(text="⚙️ Налаштування відео",   callback_data=VideoCB(action="settings").pack())
+    b.button(text="🔙 Головне меню",          callback_data="menu:main")
+    b.adjust(1)
+    return b.as_markup()
+
+
+def kb_video_settings(tg_id: int) -> InlineKeyboardMarkup:
+    s           = db.get_gen_settings(tg_id)
+    model       = s.get("video_model")           or "—"
+    w           = s.get("video_width")           or 480
+    h           = s.get("video_height")          or 288
+    frames      = s.get("video_frames")          or 25
+    fps         = s.get("video_fps")             or 8
+    steps       = s.get("video_steps")           or 25
+    cfg         = s.get("video_cfg")             or 3.5
+    strength    = s.get("video_strength",  1.0)
+    loop        = bool(s.get("video_loop", False))
+    compression = s.get("video_img_compression") or 35
+    has_neg     = bool(s.get("video_negative"))
+    b = InlineKeyboardBuilder()
+    b.button(text=f"🎞 Модель: {_short(model)}",
+             callback_data=VideoCB(action="pick_model").pack())
+    b.button(text=f"📐 Розмір: {w}×{h}",
+             callback_data=VideoCB(action="pick_res").pack())
+    b.button(text=f"🎞 Кадри: {frames}",
+             callback_data=VideoCB(action="pick_frames").pack())
+    b.button(text=f"⚡ FPS: {fps}",
+             callback_data=VideoCB(action="pick_fps").pack())
+    b.button(text=f"🎚 Кроки: {steps}",
+             callback_data=VideoCB(action="pick_steps").pack())
+    b.button(text=f"🎯 CFG: {cfg}",
+             callback_data=VideoCB(action="pick_cfg").pack())
+    b.button(text=f"🏃 Сила руху: {strength}",
+             callback_data=VideoCB(action="pick_strength").pack())
+    loop_lbl = "🔁 Loop: ВКЛ ✅" if loop else "🔁 Loop: ВИКЛ"
+    b.button(text=loop_lbl,
+             callback_data=VideoCB(action="toggle_loop").pack())
+    b.button(text=f"🎨 Препроцесинг: {compression}",
+             callback_data=VideoCB(action="pick_compression").pack())
+    b.button(text="📝 Негативний промпт" + (" ✏️" if has_neg else ""),
+             callback_data=VideoCB(action="neg").pack())
+    b.button(text="🔄 Скинути",
+             callback_data=VideoCB(action="reset").pack())
+    b.button(text="🔙 Назад",
+             callback_data=VideoCB(action="menu").pack())
+    b.adjust(1)
+    return b.as_markup()
+
+
+def _kb_video_picker(items: list, current, action: str,
+                      pack_val=str, back: str = "vid_settings") -> InlineKeyboardMarkup:
+    b = InlineKeyboardBuilder()
+    for item in items:
+        v    = pack_val(item)
+        mark = " ✅" if str(current) == str(v) else ""
+        lbl  = item if isinstance(item, str) else str(item)
+        b.button(text=f"{lbl}{mark}", callback_data=VideoCB(action=action, value=v).pack())
+    b.button(text="🔙 Назад", callback_data=VideoCB(action="settings").pack())
+    b.adjust(1)
+    return b.as_markup()
+
+
+def kb_video_model_picker(current: str, available: list[str]) -> InlineKeyboardMarkup:
+    b = InlineKeyboardBuilder()
+    if not available:
+        b.button(text="⚠️ Немає LTX-Video моделей", callback_data=VideoCB(action="settings").pack())
+    for m in available:
+        mark = " ✅" if m == current else ""
+        b.button(text=f"🎞 {_short(m)}{mark}", callback_data=VideoCB(action="set_model", value=m).pack())
+    b.button(text="🔙 Назад", callback_data=VideoCB(action="settings").pack())
+    b.adjust(1)
+    return b.as_markup()
+
+
+def kb_video_res_picker(cur_w: int, cur_h: int) -> InlineKeyboardMarkup:
+    b = InlineKeyboardBuilder()
+    for label, w, h in comfy_client.VIDEO_RES_PRESETS:
+        mark = " ✅" if w == cur_w and h == cur_h else ""
+        b.button(text=f"{label}{mark}",
+                 callback_data=VideoCB(action="set_res", value=f"{w}x{h}").pack())
+    b.button(text="🔙 Назад", callback_data=VideoCB(action="settings").pack())
+    b.adjust(2)
+    return b.as_markup()
+
+
+def kb_video_frames_picker(current: int) -> InlineKeyboardMarkup:
+    b = InlineKeyboardBuilder()
+    fps = 8  # preview calc
+    for v in comfy_client.VIDEO_FRAME_PRESETS:
+        dur  = f"{v/fps:.1f}с"
+        mark = " ✅" if v == current else ""
+        b.button(text=f"{v} кадрів ({dur}){mark}",
+                 callback_data=VideoCB(action="set_frames", value=str(v)).pack())
+    b.button(text="🔙 Назад", callback_data=VideoCB(action="settings").pack())
+    b.adjust(1)
+    return b.as_markup()
+
+
+def kb_video_fps_picker(current: float) -> InlineKeyboardMarkup:
+    b = InlineKeyboardBuilder()
+    for v in comfy_client.VIDEO_FPS_PRESETS:
+        mark = " ✅" if float(current) == v else ""
+        b.button(text=f"{v} fps{mark}",
+                 callback_data=VideoCB(action="set_fps", value=str(v)).pack())
+    b.button(text="🔙 Назад", callback_data=VideoCB(action="settings").pack())
+    b.adjust(2)
+    return b.as_markup()
+
+
+def kb_video_steps_picker(current: int) -> InlineKeyboardMarkup:
+    b = InlineKeyboardBuilder()
+    labels = {20: "швидко", 25: "стандарт", 30: "якісно", 40: "детально"}
+    for v in comfy_client.VIDEO_STEPS_PRESETS:
+        lbl  = f" ({labels[v]})" if v in labels else ""
+        mark = " ✅" if v == current else ""
+        b.button(text=f"{v}{lbl}{mark}",
+                 callback_data=VideoCB(action="set_steps", value=str(v)).pack())
+    b.button(text="🔙 Назад", callback_data=VideoCB(action="settings").pack())
+    b.adjust(2)
+    return b.as_markup()
+
+
+def kb_video_cfg_picker(current: float) -> InlineKeyboardMarkup:
+    b = InlineKeyboardBuilder()
+    for v in comfy_client.VIDEO_CFG_PRESETS:
+        mark = " ✅" if float(current) == v else ""
+        b.button(text=f"{v}{mark}",
+                 callback_data=VideoCB(action="set_cfg", value=str(v)).pack())
+    b.button(text="🔙 Назад", callback_data=VideoCB(action="settings").pack())
+    b.adjust(3)
+    return b.as_markup()
+
+
+def kb_video_cancel() -> InlineKeyboardMarkup:
+    return (InlineKeyboardBuilder()
+            .button(text="❌ Скасувати", callback_data=VideoCB(action="menu").pack())
+            .as_markup())
+
+
+def kb_video_strength_picker(current: float) -> InlineKeyboardMarkup:
+    b = InlineKeyboardBuilder()
+    options = [
+        (0.5,  "0.5 — ледве помітний"),
+        (0.6,  "0.6 — дуже плавний"),
+        (0.7,  "0.7 — ambient (рекомендовано для loop)"),
+        (0.8,  "0.8 — помітний рух"),
+        (0.85, "0.85 — активний"),
+        (0.9,  "0.9 — динамічний"),
+        (1.0,  "1.0 — максимальний"),
+    ]
+    for v, lbl in options:
+        mark = " ✅" if abs(float(current) - v) < 0.01 else ""
+        b.button(text=f"{lbl}{mark}", callback_data=VideoCB(action="set_strength", value=str(v)).pack())
+    b.button(text="🔙 Назад", callback_data=VideoCB(action="settings").pack())
+    b.adjust(1)
+    return b.as_markup()
+
+
+def kb_video_compression_picker(current: int) -> InlineKeyboardMarkup:
+    b = InlineKeyboardBuilder()
+    options = [
+        (0,  "0 — без змін (crisp)"),
+        (15, "15 — легка обробка"),
+        (35, "35 — стандарт"),
+        (50, "50 — середня"),
+        (75, "75 — художній стиль"),
+    ]
+    for v, lbl in options:
+        mark = " ✅" if int(current) == v else ""
+        b.button(text=f"{lbl}{mark}", callback_data=VideoCB(action="set_compression", value=str(v)).pack())
+    b.button(text="🔙 Назад", callback_data=VideoCB(action="settings").pack())
+    b.adjust(1)
+    return b.as_markup()
+
+
+# ── video handlers ────────────────────────────────────────────────────────
+
+@dp.callback_query(VideoCB.filter(F.action == "menu"))
+async def cb_video_menu(call: CallbackQuery, state: FSMContext) -> None:
+    allowed, _ = _ctx(call.from_user)
+    if not allowed:
+        await call.answer("⛔", show_alert=True); return
+    await state.clear()
+    await call.answer()
+    await _nav(call, _video_settings_text(call.from_user.id),
+               parse_mode="HTML", reply_markup=kb_video_menu(call.from_user.id))
+
+
+@dp.callback_query(VideoCB.filter(F.action == "settings"))
+async def cb_video_settings(call: CallbackQuery, state: FSMContext) -> None:
+    allowed, _ = _ctx(call.from_user)
+    if not allowed:
+        await call.answer("⛔", show_alert=True); return
+    await state.clear()
+    await call.answer()
+    await _nav(call, _video_settings_text(call.from_user.id),
+               parse_mode="HTML", reply_markup=kb_video_settings(call.from_user.id))
+
+
+@dp.callback_query(VideoCB.filter(F.action == "pick_model"))
+async def cb_video_pick_model(call: CallbackQuery) -> None:
+    allowed, _ = _ctx(call.from_user)
+    if not allowed:
+        await call.answer("⛔", show_alert=True); return
+    await call.answer()
+    models  = await comfy_client.fetch_video_models()
+    current = db.get_gen_settings(call.from_user.id).get("video_model", "")
+    if not models:
+        await call.answer(
+            "❌ LTX-Video моделей не знайдено.\n"
+            "Скачайте ltx-video-2b-v0.9.5.safetensors у ComfyUI/models/checkpoints/",
+            show_alert=True,
+        )
+        return
+    await _nav(call, "🎞 Оберіть відео-модель:", reply_markup=kb_video_model_picker(current, models))
+
+
+@dp.callback_query(VideoCB.filter(F.action == "set_model"))
+async def cb_video_set_model(call: CallbackQuery, callback_data: VideoCB) -> None:
+    allowed, _ = _ctx(call.from_user)
+    if not allowed:
+        await call.answer("⛔", show_alert=True); return
+    db.set_gen_setting(call.from_user.id, "video_model", callback_data.value)
+    await call.answer(f"✅ Модель: {_short(callback_data.value)}")
+    await _nav(call, _video_settings_text(call.from_user.id),
+               parse_mode="HTML", reply_markup=kb_video_settings(call.from_user.id))
+
+
+@dp.callback_query(VideoCB.filter(F.action == "pick_res"))
+async def cb_video_pick_res(call: CallbackQuery) -> None:
+    allowed, _ = _ctx(call.from_user)
+    if not allowed:
+        await call.answer("⛔", show_alert=True); return
+    await call.answer()
+    s = db.get_gen_settings(call.from_user.id)
+    await _nav(call, "📐 Оберіть роздільну здатність:\n<i>480×288 рекомендовано для RTX 3050 6GB</i>",
+               parse_mode="HTML",
+               reply_markup=kb_video_res_picker(s.get("video_width", 480), s.get("video_height", 288)))
+
+
+@dp.callback_query(VideoCB.filter(F.action == "set_res"))
+async def cb_video_set_res(call: CallbackQuery, callback_data: VideoCB) -> None:
+    allowed, _ = _ctx(call.from_user)
+    if not allowed:
+        await call.answer("⛔", show_alert=True); return
+    w, h = map(int, callback_data.value.split("x"))
+    db.set_gen_setting(call.from_user.id, "video_width",  w)
+    db.set_gen_setting(call.from_user.id, "video_height", h)
+    await call.answer(f"✅ {w}×{h}")
+    await _nav(call, _video_settings_text(call.from_user.id),
+               parse_mode="HTML", reply_markup=kb_video_settings(call.from_user.id))
+
+
+@dp.callback_query(VideoCB.filter(F.action == "pick_frames"))
+async def cb_video_pick_frames(call: CallbackQuery) -> None:
+    allowed, _ = _ctx(call.from_user)
+    if not allowed:
+        await call.answer("⛔", show_alert=True); return
+    await call.answer()
+    current = db.get_gen_settings(call.from_user.id).get("video_frames", 25)
+    await _nav(call, "🎞 Оберіть кількість кадрів:", reply_markup=kb_video_frames_picker(current))
+
+
+@dp.callback_query(VideoCB.filter(F.action == "set_frames"))
+async def cb_video_set_frames(call: CallbackQuery, callback_data: VideoCB) -> None:
+    allowed, _ = _ctx(call.from_user)
+    if not allowed:
+        await call.answer("⛔", show_alert=True); return
+    db.set_gen_setting(call.from_user.id, "video_frames", int(callback_data.value))
+    await call.answer(f"✅ {callback_data.value} кадрів")
+    await _nav(call, _video_settings_text(call.from_user.id),
+               parse_mode="HTML", reply_markup=kb_video_settings(call.from_user.id))
+
+
+@dp.callback_query(VideoCB.filter(F.action == "pick_fps"))
+async def cb_video_pick_fps(call: CallbackQuery) -> None:
+    allowed, _ = _ctx(call.from_user)
+    if not allowed:
+        await call.answer("⛔", show_alert=True); return
+    await call.answer()
+    current = db.get_gen_settings(call.from_user.id).get("video_fps", 8)
+    await _nav(call, "⚡ Оберіть FPS:", reply_markup=kb_video_fps_picker(current))
+
+
+@dp.callback_query(VideoCB.filter(F.action == "set_fps"))
+async def cb_video_set_fps(call: CallbackQuery, callback_data: VideoCB) -> None:
+    allowed, _ = _ctx(call.from_user)
+    if not allowed:
+        await call.answer("⛔", show_alert=True); return
+    db.set_gen_setting(call.from_user.id, "video_fps", float(callback_data.value))
+    await call.answer(f"✅ {callback_data.value} fps")
+    await _nav(call, _video_settings_text(call.from_user.id),
+               parse_mode="HTML", reply_markup=kb_video_settings(call.from_user.id))
+
+
+@dp.callback_query(VideoCB.filter(F.action == "pick_steps"))
+async def cb_video_pick_steps(call: CallbackQuery) -> None:
+    allowed, _ = _ctx(call.from_user)
+    if not allowed:
+        await call.answer("⛔", show_alert=True); return
+    await call.answer()
+    current = db.get_gen_settings(call.from_user.id).get("video_steps", 25)
+    await _nav(call, "🎚 Оберіть кількість кроків:", reply_markup=kb_video_steps_picker(current))
+
+
+@dp.callback_query(VideoCB.filter(F.action == "set_steps"))
+async def cb_video_set_steps(call: CallbackQuery, callback_data: VideoCB) -> None:
+    allowed, _ = _ctx(call.from_user)
+    if not allowed:
+        await call.answer("⛔", show_alert=True); return
+    db.set_gen_setting(call.from_user.id, "video_steps", int(callback_data.value))
+    await call.answer(f"✅ {callback_data.value} кроків")
+    await _nav(call, _video_settings_text(call.from_user.id),
+               parse_mode="HTML", reply_markup=kb_video_settings(call.from_user.id))
+
+
+@dp.callback_query(VideoCB.filter(F.action == "pick_cfg"))
+async def cb_video_pick_cfg(call: CallbackQuery) -> None:
+    allowed, _ = _ctx(call.from_user)
+    if not allowed:
+        await call.answer("⛔", show_alert=True); return
+    await call.answer()
+    current = db.get_gen_settings(call.from_user.id).get("video_cfg", 3.5)
+    await _nav(call, "🎯 Оберіть CFG Scale:", reply_markup=kb_video_cfg_picker(current))
+
+
+@dp.callback_query(VideoCB.filter(F.action == "set_cfg"))
+async def cb_video_set_cfg(call: CallbackQuery, callback_data: VideoCB) -> None:
+    allowed, _ = _ctx(call.from_user)
+    if not allowed:
+        await call.answer("⛔", show_alert=True); return
+    db.set_gen_setting(call.from_user.id, "video_cfg", float(callback_data.value))
+    await call.answer(f"✅ CFG {callback_data.value}")
+    await _nav(call, _video_settings_text(call.from_user.id),
+               parse_mode="HTML", reply_markup=kb_video_settings(call.from_user.id))
+
+
+@dp.callback_query(VideoCB.filter(F.action == "neg"))
+async def cb_video_neg(call: CallbackQuery, state: FSMContext) -> None:
+    allowed, _ = _ctx(call.from_user)
+    if not allowed:
+        await call.answer("⛔", show_alert=True); return
+    await state.set_state(VideoSettingsState.waiting_neg)
+    await call.answer()
+    has = bool(db.get_gen_settings(call.from_user.id).get("video_negative"))
+    b = InlineKeyboardBuilder()
+    if has:
+        b.button(text="🗑 Видалити", callback_data=VideoCB(action="neg_clear").pack())
+    b.button(text="❌ Скасувати", callback_data=VideoCB(action="settings").pack())
+    await _nav(call, "📝 Введіть негативний промпт для відео:", reply_markup=b.as_markup())
+
+
+@dp.message(VideoSettingsState.waiting_neg, F.text)
+async def handle_video_neg(message: Message, state: FSMContext) -> None:
+    db.set_gen_setting(message.from_user.id, "video_negative", message.text.strip())
+    await state.clear()
+    await message.answer(_video_settings_text(message.from_user.id),
+                         parse_mode="HTML",
+                         reply_markup=kb_video_settings(message.from_user.id))
+
+
+@dp.callback_query(VideoCB.filter(F.action == "neg_clear"))
+async def cb_video_neg_clear(call: CallbackQuery, state: FSMContext) -> None:
+    allowed, _ = _ctx(call.from_user)
+    if not allowed:
+        await call.answer("⛔", show_alert=True); return
+    await state.clear()
+    db.set_gen_setting(call.from_user.id, "video_negative", None)
+    await call.answer("✅ Скинуто")
+    await _nav(call, _video_settings_text(call.from_user.id),
+               parse_mode="HTML", reply_markup=kb_video_settings(call.from_user.id))
+
+
+@dp.callback_query(VideoCB.filter(F.action == "pick_strength"))
+async def cb_video_pick_strength(call: CallbackQuery) -> None:
+    allowed, _ = _ctx(call.from_user)
+    if not allowed:
+        await call.answer("⛔", show_alert=True); return
+    await call.answer()
+    current = float(db.get_gen_settings(call.from_user.id).get("video_strength", 1.0))
+    await _nav(call,
+               "🏃 <b>Сила руху</b>\n\n"
+               "Наскільки анімація відхиляється від вхідного зображення.\n"
+               "<i>Для безшовного loop рекомендовано 0.6–0.8</i>",
+               parse_mode="HTML",
+               reply_markup=kb_video_strength_picker(current))
+
+
+@dp.callback_query(VideoCB.filter(F.action == "set_strength"))
+async def cb_video_set_strength(call: CallbackQuery, callback_data: VideoCB) -> None:
+    allowed, _ = _ctx(call.from_user)
+    if not allowed:
+        await call.answer("⛔", show_alert=True); return
+    v = float(callback_data.value)
+    db.set_gen_setting(call.from_user.id, "video_strength", v)
+    await call.answer(f"✅ Сила руху: {v}")
+    await _nav(call, _video_settings_text(call.from_user.id),
+               parse_mode="HTML", reply_markup=kb_video_settings(call.from_user.id))
+
+
+@dp.callback_query(VideoCB.filter(F.action == "toggle_loop"))
+async def cb_video_toggle_loop(call: CallbackQuery) -> None:
+    allowed, _ = _ctx(call.from_user)
+    if not allowed:
+        await call.answer("⛔", show_alert=True); return
+    current = bool(db.get_gen_settings(call.from_user.id).get("video_loop", False))
+    new_val = not current
+    db.set_gen_setting(call.from_user.id, "video_loop", new_val)
+    await call.answer("🔁 Loop увімкнено ✅" if new_val else "➡️ Loop вимкнено")
+    await _nav(call, _video_settings_text(call.from_user.id),
+               parse_mode="HTML", reply_markup=kb_video_settings(call.from_user.id))
+
+
+@dp.callback_query(VideoCB.filter(F.action == "pick_compression"))
+async def cb_video_pick_compression(call: CallbackQuery) -> None:
+    allowed, _ = _ctx(call.from_user)
+    if not allowed:
+        await call.answer("⛔", show_alert=True); return
+    await call.answer()
+    current = int(db.get_gen_settings(call.from_user.id).get("video_img_compression", 35))
+    await _nav(call,
+               "🎨 <b>Препроцесинг зображення</b>\n\n"
+               "Рівень стиснення перед передачею в LTX-Video.\n"
+               "<i>0 = crisp оригінал, 75 = художній/м'якший стиль</i>",
+               parse_mode="HTML",
+               reply_markup=kb_video_compression_picker(current))
+
+
+@dp.callback_query(VideoCB.filter(F.action == "set_compression"))
+async def cb_video_set_compression(call: CallbackQuery, callback_data: VideoCB) -> None:
+    allowed, _ = _ctx(call.from_user)
+    if not allowed:
+        await call.answer("⛔", show_alert=True); return
+    v = int(callback_data.value)
+    db.set_gen_setting(call.from_user.id, "video_img_compression", v)
+    await call.answer(f"✅ Препроцесинг: {v}")
+    await _nav(call, _video_settings_text(call.from_user.id),
+               parse_mode="HTML", reply_markup=kb_video_settings(call.from_user.id))
+
+
+@dp.callback_query(VideoCB.filter(F.action == "reset"))
+async def cb_video_reset(call: CallbackQuery) -> None:
+    allowed, _ = _ctx(call.from_user)
+    if not allowed:
+        await call.answer("⛔", show_alert=True); return
+    for key in ("video_model", "video_width", "video_height", "video_frames",
+                "video_fps", "video_steps", "video_cfg", "video_negative", "video_mode",
+                "video_strength", "video_loop", "video_img_compression"):
+        db.set_gen_setting(call.from_user.id, key, None)
+    await call.answer("✅ Налаштування відео скинуті")
+    await _nav(call, _video_settings_text(call.from_user.id),
+               parse_mode="HTML", reply_markup=kb_video_settings(call.from_user.id))
+
+
+# ── video generation: text2video ──────────────────────────────────────────
+
+@dp.callback_query(VideoCB.filter(F.action == "t2v"))
+async def cb_video_t2v(call: CallbackQuery, state: FSMContext) -> None:
+    allowed, _ = _ctx(call.from_user)
+    if not allowed:
+        await call.answer("⛔", show_alert=True); return
+    s = db.get_gen_settings(call.from_user.id)
+    if not s.get("video_model"):
+        await call.answer("⚠️ Спочатку оберіть відео-модель у налаштуваннях!", show_alert=True)
+        return
+    await state.set_state(VideoGenState.waiting_prompt)
+    await call.answer()
+    await _nav(call, "🎬 <b>Текст → Відео</b>\n\nВведіть промпт для генерації:",
+               parse_mode="HTML", reply_markup=kb_video_cancel())
+
+
+@dp.message(VideoGenState.waiting_prompt, F.text)
+async def handle_video_t2v_prompt(message: Message, state: FSMContext) -> None:
+    allowed, _ = _ctx(message.from_user)
+    if not allowed:
+        await state.clear()
+        await message.answer("⛔"); return
+    prompt = message.text.strip()
+    await state.clear()
+    await _do_generate_video(message, prompt, input_image=None)
+
+
+# ── video generation: image2video ─────────────────────────────────────────
+
+@dp.callback_query(VideoCB.filter(F.action == "i2v"))
+async def cb_video_i2v(call: CallbackQuery, state: FSMContext) -> None:
+    allowed, _ = _ctx(call.from_user)
+    if not allowed:
+        await call.answer("⛔", show_alert=True); return
+    s = db.get_gen_settings(call.from_user.id)
+    if not s.get("video_model"):
+        await call.answer("⚠️ Спочатку оберіть відео-модель у налаштуваннях!", show_alert=True)
+        return
+    await state.set_state(VideoImg2VidState.waiting_photo)
+    await call.answer()
+    await _nav(call,
+               "🎬 <b>Зображення → Відео</b>\n\n"
+               "Надішліть фото (можна одразу з підписом як промпт).",
+               parse_mode="HTML", reply_markup=kb_video_cancel())
+
+
+@dp.message(VideoImg2VidState.waiting_photo, F.photo)
+async def handle_video_i2v_photo(message: Message, state: FSMContext) -> None:
+    allowed, _ = _ctx(message.from_user)
+    if not allowed:
+        await state.clear()
+        await message.answer("⛔"); return
+    prompt      = (message.caption or "").strip() or "smooth cinematic motion, high quality video"
+    image_bytes = await _download_photo(message.photo[-1].file_id)
+    await state.clear()
+    await _do_generate_video(message, prompt, input_image=image_bytes)
+
+
+@dp.message(VideoImg2VidState.waiting_photo, F.text)
+async def handle_video_i2v_text(message: Message) -> None:
+    await message.answer("📷 Надішліть фото (можна з підписом-промптом) або скасуйте.")
+
+
+# ── core video generation ─────────────────────────────────────────────────
+
+async def _do_generate_video(
+    message: Message,
+    prompt: str,
+    input_image: Optional[bytes],
+) -> None:
+    from aiogram.types import BufferedInputFile
+    tg_id = message.from_user.id
+    s     = db.get_gen_settings(tg_id)
+
+    frames = int(s.get("video_frames") or 25)
+    fps    = float(s.get("video_fps") or 8)
+    steps  = int(s.get("video_steps") or 25)
+    mode   = "img2video" if input_image else "txt2video"
+
+    status = await message.answer(
+        f"🎬 <b>Генерація відео…</b>\n\n"
+        f"📝 {prompt[:100]}{'…' if len(prompt)>100 else ''}\n\n"
+        f"🎞 {frames} кадрів  •  ⚡ {fps} fps  •  🎚 {steps} кроків\n"
+        f"⏳ Це може зайняти кілька хвилин…",
+        parse_mode="HTML",
+    )
+
+    last_upd = [0.0]
+    import time as _time
+
+    async def on_progress(step: int, total: int) -> None:
+        now = _time.monotonic()
+        if now - last_upd[0] < 3.0:
+            return
+        last_upd[0] = now
+        bar = comfy_client.progress_bar(step, total)
+        try:
+            await status.edit_text(
+                f"🎬 <b>Генерація відео…</b>\n\n"
+                f"<code>{bar}</code>  крок {step}/{total}\n"
+                f"🎞 {frames} кадрів  •  ⚡ {fps} fps",
+                parse_mode="HTML",
+            )
+        except Exception:
+            pass
+
+    try:
+        webp_bytes = await comfy_client.generate_video(
+            prompt,
+            on_progress=on_progress,
+            user_settings=s,
+            input_image=input_image,
+        )
+    except Exception as exc:
+        log.exception("video gen failed")
+        try:
+            await status.edit_text(
+                f"❌ <b>Помилка генерації відео</b>\n\n<code>{exc!s:.300}</code>",
+                parse_mode="HTML",
+                reply_markup=InlineKeyboardBuilder()
+                    .button(text="🔙 Меню відео", callback_data=VideoCB(action="menu").pack())
+                    .as_markup(),
+            )
+        except Exception:
+            pass
+        return
+
+    # Send animated WEBP as animation
+    caption = (
+        f"🎬 <b>Відео готове!</b>\n"
+        f"📝 {prompt[:120]}{'…' if len(prompt)>120 else ''}\n"
+        f"🎞 {frames} кадрів  •  ⚡ {fps} fps  •  {mode}"
+    )
+    try:
+        await message.answer_animation(
+            BufferedInputFile(webp_bytes, filename="video.webp"),
+            caption=caption, parse_mode="HTML",
+        )
+    except Exception:
+        # fallback: send as document
+        try:
+            await message.answer_document(
+                BufferedInputFile(webp_bytes, filename="video.webp"),
+                caption=caption, parse_mode="HTML",
+            )
+        except Exception as e:
+            log.warning("video send failed: %s", e)
+
+    try:
+        await status.delete()
+    except Exception:
+        pass
+
+
 # ── error handler ─────────────────────────────────────────────────────────
 
 @dp.errors()
@@ -1224,6 +1979,21 @@ async def cmd_gen(message: Message, state: FSMContext) -> None:
                              reply_markup=kb_cancel_to_main())
 
 
+@dp.message(Command("voice"))
+async def cmd_voice(message: Message, state: FSMContext) -> None:
+    await voice_ui.cmd_voice(message, state)
+
+
+@dp.message(Command("music"))
+async def cmd_music(message: Message, state: FSMContext) -> None:
+    await music_ui.cmd_music(message, state)
+
+
+@dp.message(Command("qwen"))
+async def cmd_qwen(message: Message, state: FSMContext) -> None:
+    await qwen_ui.cmd_qwen(message, state)
+
+
 # ── /settings ─────────────────────────────────────────────────────────────
 
 @dp.message(Command("settings"))
@@ -1297,6 +2067,9 @@ async def cb_gen_start(call: CallbackQuery, state: FSMContext) -> None:
     if not allowed:
         await call.answer("⛔ У вас немає доступу.", show_alert=True)
         return
+    if qwen_ui.is_active(call.from_user.id):
+        await qwen_ui.cb_prompt(call, state)
+        return
     gs   = db.get_gen_settings(call.from_user.id)
     mode = gs.get("mode", "text2img")
     if mode == "img2img":
@@ -1369,6 +2142,9 @@ async def handle_photo(message: Message, state: FSMContext) -> None:
     if not allowed:
         await message.answer("⛔ У вас немає доступу до цього бота.")
         return
+    if qwen_ui.is_active(message.from_user.id):
+        await qwen_ui.handle_photo_in_qwen_mode(message, state)
+        return
     gs   = db.get_gen_settings(message.from_user.id)
     mode = gs.get("mode", "text2img")
     if mode != "img2img":
@@ -1398,6 +2174,12 @@ async def handle_text(message: Message, state: FSMContext) -> None:
     allowed, _ = _ctx(message.from_user)
     if not allowed:
         await message.answer("⛔ У вас немає доступу до цього бота.")
+        return
+    if voice_ui.is_active(message.from_user.id):
+        await voice_ui.speak(message, message.from_user, message.text.strip())
+        return
+    if qwen_ui.is_active(message.from_user.id):
+        await qwen_ui.generate(message, message.text.strip(), message.from_user)
         return
     gs   = db.get_gen_settings(message.from_user.id)
     mode = gs.get("mode", "text2img")
@@ -1602,6 +2384,13 @@ async def _do_generate(
         if remaining[0] == 0:
             await _finalize(msg)
 
+    _wf       = user_settings.get("_workflow_type", "sd15")
+    _job_eta  = {"sd15": 15, "sdxl": 50, "flux": 150, "sd3": 60, "hidream": 900}.get(_wf, 60) * (
+                    2 if user_settings.get("hires_fix") else 1)
+    _job_label = f"🎨 {_label(_ckpt, models_db.labels())}" + (" · img2img" if input_image else "")
+    if batch_size > 1:
+        _job_label += f" ×{batch_size}"
+
     ahead = gq.queue_len()
     if ahead == 0:
         status_text = "⏳ Підключаюсь до ComfyUI..."
@@ -1634,6 +2423,8 @@ async def _do_generate(
             batch_total=batch_size,
             cancel_kb=cancel_kb,
             on_cancel=on_cancel,
+            label=_job_label,
+            eta=_job_eta,
         ))
 
 # ── вибір стилю перед генерацією ─────────────────────────────────────────
@@ -3440,51 +4231,240 @@ async def handle_new_role(call: CallbackQuery, state: FSMContext) -> None:
     await call.answer(f"✅ @{username} додано як {role_text}.", show_alert=True)
     await call.message.edit_text(_users_text(), parse_mode="HTML", reply_markup=kb_users())
 
-# ── MMORPG game item generation ──────────────────────────────────────────
+# ── MMORPG game generation ────────────────────────────────────────────────
 
-_game_gen_task: Optional[asyncio.Task] = None
+_game_gen_task:          Optional[asyncio.Task] = None
+_game_monster_gen_task:  Optional[asyncio.Task] = None
+_game_npc_gen_task:      Optional[asyncio.Task] = None
+_game_location_gen_task: Optional[asyncio.Task] = None
+
+_game_vid_gen_task:          Optional[asyncio.Task] = None
+_game_vid_monster_gen_task:  Optional[asyncio.Task] = None
+_game_vid_npc_gen_task:      Optional[asyncio.Task] = None
+_game_vid_location_gen_task: Optional[asyncio.Task] = None
+
+_game_skill_gen_task:        Optional[asyncio.Task] = None
+_game_vid_skill_gen_task:    Optional[asyncio.Task] = None
 
 
-def _game_gen_running() -> bool:
-    return _game_gen_task is not None and not _game_gen_task.done()
+def _game_gen_running()              -> bool: return _game_gen_task              is not None and not _game_gen_task.done()
+def _game_monster_gen_running()      -> bool: return _game_monster_gen_task      is not None and not _game_monster_gen_task.done()
+def _game_npc_gen_running()          -> bool: return _game_npc_gen_task          is not None and not _game_npc_gen_task.done()
+def _game_location_gen_running()     -> bool: return _game_location_gen_task     is not None and not _game_location_gen_task.done()
+def _game_skill_gen_running()        -> bool: return _game_skill_gen_task        is not None and not _game_skill_gen_task.done()
+
+def _game_vid_gen_running()          -> bool: return _game_vid_gen_task          is not None and not _game_vid_gen_task.done()
+def _game_vid_monster_gen_running()  -> bool: return _game_vid_monster_gen_task  is not None and not _game_vid_monster_gen_task.done()
+def _game_vid_npc_gen_running()      -> bool: return _game_vid_npc_gen_task      is not None and not _game_vid_npc_gen_task.done()
+def _game_vid_location_gen_running() -> bool: return _game_vid_location_gen_task is not None and not _game_vid_location_gen_task.done()
+def _game_vid_skill_gen_running()    -> bool: return _game_vid_skill_gen_task    is not None and not _game_vid_skill_gen_task.done()
 
 
-def _kb_game_stop() -> InlineKeyboardMarkup:
-    return (InlineKeyboardBuilder()
-            .button(text="⛔ Зупинити генерацію", callback_data="game:stop")
-            .as_markup())
+def _kb_stop(cb: str, label: str) -> InlineKeyboardMarkup:
+    return InlineKeyboardBuilder().button(text=f"⛔ {label}", callback_data=cb).as_markup()
+
+def _kb_items_stop()         -> InlineKeyboardMarkup: return _kb_stop("game:items_stop",         "Зупинити зображення предметів")
+def _kb_monsters_stop()      -> InlineKeyboardMarkup: return _kb_stop("game:monsters_stop",      "Зупинити зображення монстрів")
+def _kb_npcs_stop()          -> InlineKeyboardMarkup: return _kb_stop("game:npcs_stop",          "Зупинити зображення NPC")
+def _kb_locations_stop()     -> InlineKeyboardMarkup: return _kb_stop("game:locations_stop",     "Зупинити зображення локацій")
+
+def _kb_items_vid_stop()     -> InlineKeyboardMarkup: return _kb_stop("game:items_vid_stop",     "Зупинити відео предметів")
+def _kb_monsters_vid_stop()  -> InlineKeyboardMarkup: return _kb_stop("game:monsters_vid_stop",  "Зупинити відео монстрів")
+def _kb_npcs_vid_stop()      -> InlineKeyboardMarkup: return _kb_stop("game:npcs_vid_stop",      "Зупинити відео NPC")
+def _kb_locations_vid_stop() -> InlineKeyboardMarkup: return _kb_stop("game:locations_vid_stop", "Зупинити відео локацій")
+
+def _kb_skills_stop()        -> InlineKeyboardMarkup: return _kb_stop("game:skills_stop",        "Зупинити зображення скілів")
+def _kb_skills_vid_stop()    -> InlineKeyboardMarkup: return _kb_stop("game:skills_vid_stop",    "Зупинити відео скілів")
 
 
-@dp.callback_query(F.data == "game:gen")
-async def cb_game_gen(call: CallbackQuery) -> None:
+# ── helpers for start/stop callbacks ─────────────────────────────────────
+
+async def _mmorpg_admin_check(call: CallbackQuery) -> bool:
     _, admin = _ctx(call.from_user)
     if not admin:
         await call.answer("⛔ Доступ лише для адміністраторів.", show_alert=True)
+    return admin
+
+
+async def _mmorpg_stop(call: CallbackQuery, task: Optional[asyncio.Task],
+                       running_fn) -> None:
+    if not await _mmorpg_admin_check(call):
         return
-    await call.answer()
-
-    if _game_gen_running():
-        await call.answer("⚙️ Генерація вже запущена.", show_alert=True)
-        return
-
-    global _game_gen_task
-    _game_gen_task = asyncio.create_task(
-        _run_game_gen(call.message, call.from_user)
-    )
-
-
-@dp.callback_query(F.data == "game:stop")
-async def cb_game_stop(call: CallbackQuery) -> None:
-    _, admin = _ctx(call.from_user)
-    if not admin:
-        await call.answer("⛔", show_alert=True)
-        return
-    if _game_gen_running():
-        _game_gen_task.cancel()
-        await call.answer("⛔ Зупиняю…", show_alert=False)
+    if running_fn():
+        task.cancel()
+        await call.answer("⛔ Зупиняю…")
     else:
         await call.answer("ℹ️ Генерація вже завершена.", show_alert=True)
         await call.message.edit_reply_markup(reply_markup=None)
+
+
+# ── menu callback ─────────────────────────────────────────────────────────
+
+@dp.callback_query(F.data == "game:menu")
+async def cb_game_menu(call: CallbackQuery) -> None:
+    if not await _mmorpg_admin_check(call):
+        return
+    await call.answer()
+    await _nav(call,
+               "🎮 <b>MMORPG ROE</b>\n\n"
+               "🖼 — генерація зображень\n"
+               "🎬 — генерація відео\n\n"
+               "Оберіть тип контенту:",
+               parse_mode="HTML", reply_markup=kb_mmorpg_menu())
+
+
+# ── start / stop callbacks ────────────────────────────────────────────────
+
+@dp.callback_query(F.data == "game:items_gen")
+async def cb_game_items_gen(call: CallbackQuery) -> None:
+    if not await _mmorpg_admin_check(call):
+        return
+    await call.answer()
+    if _game_gen_running():
+        await call.answer("⚙️ Генерація предметів вже запущена.", show_alert=True); return
+    global _game_gen_task
+    _game_gen_task = asyncio.create_task(_run_game_gen(call.message, call.from_user))
+
+@dp.callback_query(F.data == "game:items_stop")
+async def cb_game_items_stop(call: CallbackQuery) -> None:
+    await _mmorpg_stop(call, _game_gen_task, _game_gen_running)
+
+
+@dp.callback_query(F.data == "game:monsters_gen")
+async def cb_game_monsters_gen(call: CallbackQuery) -> None:
+    if not await _mmorpg_admin_check(call):
+        return
+    await call.answer()
+    if _game_monster_gen_running():
+        await call.answer("⚙️ Генерація монстрів вже запущена.", show_alert=True); return
+    global _game_monster_gen_task
+    _game_monster_gen_task = asyncio.create_task(_run_game_monster_gen(call.message, call.from_user))
+
+@dp.callback_query(F.data == "game:monsters_stop")
+async def cb_game_monsters_stop(call: CallbackQuery) -> None:
+    await _mmorpg_stop(call, _game_monster_gen_task, _game_monster_gen_running)
+
+
+@dp.callback_query(F.data == "game:npcs_gen")
+async def cb_game_npcs_gen(call: CallbackQuery) -> None:
+    if not await _mmorpg_admin_check(call):
+        return
+    await call.answer()
+    if _game_npc_gen_running():
+        await call.answer("⚙️ Генерація NPC вже запущена.", show_alert=True); return
+    global _game_npc_gen_task
+    _game_npc_gen_task = asyncio.create_task(_run_game_npc_gen(call.message, call.from_user))
+
+@dp.callback_query(F.data == "game:npcs_stop")
+async def cb_game_npcs_stop(call: CallbackQuery) -> None:
+    await _mmorpg_stop(call, _game_npc_gen_task, _game_npc_gen_running)
+
+
+@dp.callback_query(F.data == "game:locations_gen")
+async def cb_game_locations_gen(call: CallbackQuery) -> None:
+    if not await _mmorpg_admin_check(call):
+        return
+    await call.answer()
+    if _game_location_gen_running():
+        await call.answer("⚙️ Генерація локацій вже запущена.", show_alert=True); return
+    global _game_location_gen_task
+    _game_location_gen_task = asyncio.create_task(_run_game_location_gen(call.message, call.from_user))
+
+@dp.callback_query(F.data == "game:locations_stop")
+async def cb_game_locations_stop(call: CallbackQuery) -> None:
+    await _mmorpg_stop(call, _game_location_gen_task, _game_location_gen_running)
+
+
+@dp.callback_query(F.data == "game:skills_gen")
+async def cb_game_skills_gen(call: CallbackQuery) -> None:
+    if not await _mmorpg_admin_check(call):
+        return
+    await call.answer()
+    if _game_skill_gen_running():
+        await call.answer("⚙️ Генерація скілів вже запущена.", show_alert=True); return
+    global _game_skill_gen_task
+    _game_skill_gen_task = asyncio.create_task(_run_game_skill_gen(call.message, call.from_user))
+
+@dp.callback_query(F.data == "game:skills_stop")
+async def cb_game_skills_stop(call: CallbackQuery) -> None:
+    await _mmorpg_stop(call, _game_skill_gen_task, _game_skill_gen_running)
+
+
+# ── video gen start / stop callbacks ─────────────────────────────────────
+
+@dp.callback_query(F.data == "game:items_vid_gen")
+async def cb_game_items_vid_gen(call: CallbackQuery) -> None:
+    if not await _mmorpg_admin_check(call):
+        return
+    await call.answer()
+    if _game_vid_gen_running():
+        await call.answer("⚙️ Генерація відео предметів вже запущена.", show_alert=True); return
+    global _game_vid_gen_task
+    _game_vid_gen_task = asyncio.create_task(_run_game_vid_gen(call.message, call.from_user))
+
+@dp.callback_query(F.data == "game:items_vid_stop")
+async def cb_game_items_vid_stop(call: CallbackQuery) -> None:
+    await _mmorpg_stop(call, _game_vid_gen_task, _game_vid_gen_running)
+
+
+@dp.callback_query(F.data == "game:monsters_vid_gen")
+async def cb_game_monsters_vid_gen(call: CallbackQuery) -> None:
+    if not await _mmorpg_admin_check(call):
+        return
+    await call.answer()
+    if _game_vid_monster_gen_running():
+        await call.answer("⚙️ Генерація відео монстрів вже запущена.", show_alert=True); return
+    global _game_vid_monster_gen_task
+    _game_vid_monster_gen_task = asyncio.create_task(_run_game_vid_monster_gen(call.message, call.from_user))
+
+@dp.callback_query(F.data == "game:monsters_vid_stop")
+async def cb_game_monsters_vid_stop(call: CallbackQuery) -> None:
+    await _mmorpg_stop(call, _game_vid_monster_gen_task, _game_vid_monster_gen_running)
+
+
+@dp.callback_query(F.data == "game:npcs_vid_gen")
+async def cb_game_npcs_vid_gen(call: CallbackQuery) -> None:
+    if not await _mmorpg_admin_check(call):
+        return
+    await call.answer()
+    if _game_vid_npc_gen_running():
+        await call.answer("⚙️ Генерація відео NPC вже запущена.", show_alert=True); return
+    global _game_vid_npc_gen_task
+    _game_vid_npc_gen_task = asyncio.create_task(_run_game_vid_npc_gen(call.message, call.from_user))
+
+@dp.callback_query(F.data == "game:npcs_vid_stop")
+async def cb_game_npcs_vid_stop(call: CallbackQuery) -> None:
+    await _mmorpg_stop(call, _game_vid_npc_gen_task, _game_vid_npc_gen_running)
+
+
+@dp.callback_query(F.data == "game:locations_vid_gen")
+async def cb_game_locations_vid_gen(call: CallbackQuery) -> None:
+    if not await _mmorpg_admin_check(call):
+        return
+    await call.answer()
+    if _game_vid_location_gen_running():
+        await call.answer("⚙️ Генерація відео локацій вже запущена.", show_alert=True); return
+    global _game_vid_location_gen_task
+    _game_vid_location_gen_task = asyncio.create_task(_run_game_vid_location_gen(call.message, call.from_user))
+
+@dp.callback_query(F.data == "game:locations_vid_stop")
+async def cb_game_locations_vid_stop(call: CallbackQuery) -> None:
+    await _mmorpg_stop(call, _game_vid_location_gen_task, _game_vid_location_gen_running)
+
+
+@dp.callback_query(F.data == "game:skills_vid_gen")
+async def cb_game_skills_vid_gen(call: CallbackQuery) -> None:
+    if not await _mmorpg_admin_check(call):
+        return
+    await call.answer()
+    if _game_vid_skill_gen_running():
+        await call.answer("⚙️ Генерація відео скілів вже запущена.", show_alert=True); return
+    global _game_vid_skill_gen_task
+    _game_vid_skill_gen_task = asyncio.create_task(_run_game_vid_skill_gen(call.message, call.from_user))
+
+@dp.callback_query(F.data == "game:skills_vid_stop")
+async def cb_game_skills_vid_stop(call: CallbackQuery) -> None:
+    await _mmorpg_stop(call, _game_vid_skill_gen_task, _game_vid_skill_gen_running)
 
 
 def _to_webp(png_bytes: bytes, quality: int = 85) -> bytes:
@@ -3501,7 +4481,7 @@ def _to_webp(png_bytes: bytes, quality: int = 85) -> bytes:
 
 async def _gg_edit(status_ref: list, trigger_msg: Message,
                    text: str, **kwargs) -> None:
-    """Edit status message; if deleted — recreate it transparently."""
+    """Edit status message in place; if deleted — recreate it transparently."""
     try:
         await status_ref[0].edit_text(text, **kwargs)
     except TelegramBadRequest as e:
@@ -3515,11 +4495,25 @@ async def _gg_edit(status_ref: list, trigger_msg: Message,
         pass
 
 
+async def _gg_bump_status(status_ref: list, trigger_msg: Message,
+                          text: str, **kwargs) -> None:
+    """Delete current status message and send a new one at the bottom of the feed."""
+    try:
+        await status_ref[0].delete()
+    except Exception:
+        pass
+    try:
+        status_ref[0] = await trigger_msg.answer(text, **kwargs)
+    except Exception:
+        pass
+
+
 async def _gg_wait_for(
     service_name: str,
     check_fn,                  # async () -> bool
     edit_fn,                   # async (text, **kw) -> None  — may be None for silent waits
     interval: int = 30,
+    stop_kb=None,              # InlineKeyboardMarkup to show while waiting
 ) -> None:
     """
     Block until check_fn() returns True.
@@ -3542,7 +4536,7 @@ async def _gg_wait_for(
                 f"⏸ <b>{service_name} недоступний</b>\n\n"
                 f"⏳ Чекаю відновлення… спроба <b>{attempt}</b>\n"
                 f"Пройшло: <b>{t_str}</b>  •  Перевірка через {interval}с",
-                parse_mode="HTML", reply_markup=_kb_game_stop(),
+                parse_mode="HTML", reply_markup=stop_kb,
             )
         await asyncio.sleep(interval)
 
@@ -3551,13 +4545,13 @@ async def _gg_wait_for(
         if edit_fn:
             await edit_fn(
                 f"✅ <b>{service_name} відновлено!</b> Продовжую…",
-                parse_mode="HTML", reply_markup=_kb_game_stop(),
+                parse_mode="HTML", reply_markup=stop_kb,
             )
             await asyncio.sleep(1)
 
 
 async def _check_game_api() -> bool:
-    """Quick availability check for the game API (does NOT count against rate limits)."""
+    """Ping the game API — reused for both items and monsters health checks."""
     try:
         await game_api.fetch_items()
         return True
@@ -3567,20 +4561,22 @@ async def _check_game_api() -> bool:
         return False
 
 
+
 async def _gg_generate(
     prompt: str,
     on_progress,
     user_settings: dict,
     edit_fn,
+    stop_kb=None,
 ) -> bytes:
     """
     Generate image with automatic recovery:
     - Waits for ComfyUI if offline before starting
     - If ComfyUI drops mid-generation → waits for it, then retries once
     """
-    await _gg_wait_for("ComfyUI", comfy_client.ping, edit_fn)
+    await _gg_wait_for("ComfyUI", comfy_client.ping, edit_fn, stop_kb=stop_kb)
 
-    for attempt in range(2):          # initial try + 1 recovery
+    for attempt in range(2):
         try:
             return await comfy_client.generate(
                 prompt, on_progress=on_progress, user_settings=user_settings,
@@ -3590,28 +4586,30 @@ async def _gg_generate(
         except Exception as exc:
             log.warning("game_gen: generate error (attempt %d): %s", attempt + 1, exc)
             if attempt == 0 and not await comfy_client.ping():
-                # ComfyUI went down mid-generation — wait and retry
-                await _gg_wait_for("ComfyUI", comfy_client.ping, edit_fn)
+                await _gg_wait_for("ComfyUI", comfy_client.ping, edit_fn, stop_kb=stop_kb)
                 continue
             raise
 
 
 async def _gg_upload(
-    item_id:    str,
+    entity_id:  str,
     webp_bytes: bytes,
     filename:   str,
+    upload_fn,          # async (id, bytes, filename) -> (bool, str)
+    check_fn,           # async () -> bool — API health check
     edit_fn     = None,
+    stop_kb     = None,
 ) -> tuple[bool, str]:
     """
     Upload with full recovery and status updates:
-    - Transient errors (5xx / connection / 429) → wait for Game API (with status msg), retry
+    - Transient errors (5xx / connection / 429) → wait for API (with status msg), retry
     - Permanent errors (4xx except 429)         → return failure immediately
     """
     attempt = 0
     while True:
         attempt += 1
         try:
-            success, result = await game_api.upload_image(item_id, webp_bytes, filename)
+            success, result = await upload_fn(entity_id, webp_bytes, filename)
             if success:
                 return True, result
             is_transient = (
@@ -3621,205 +4619,626 @@ async def _gg_upload(
                 or "connection" in result.lower()
             )
             if not is_transient:
-                log.error("game_gen: upload permanent failure %s: %s", item_id, result)
+                log.error("game_gen: upload permanent failure %s: %s", entity_id, result)
                 return False, result
             log.warning("game_gen: upload transient %s (attempt %d): %s",
-                        item_id, attempt, result)
+                        entity_id, attempt, result)
         except asyncio.CancelledError:
             raise
         except Exception as exc:
             log.warning("game_gen: upload exception %s (attempt %d): %s",
-                        item_id, attempt, exc)
+                        entity_id, attempt, exc)
 
-        # Wait for Game API to come back — with visible status update
-        await _gg_wait_for("Game API", _check_game_api,
-                           edit_fn=edit_fn, interval=30)
+        await _gg_wait_for("Game API", check_fn, edit_fn=edit_fn, interval=30, stop_kb=stop_kb)
         await asyncio.sleep(min(attempt * 2, 30))
 
 
-# ── main background task ──────────────────────────────────────────────────
+# ── generic generation loop ───────────────────────────────────────────────
 
-async def _run_game_gen(trigger_msg: Message, admin_user) -> None:
-    """Fetch items → generate variants → show each → upload (parallel with retry)."""
+async def _run_gen_loop(
+    trigger_msg,
+    admin_user,
+    *,
+    fetch_fn,            # async () -> list[GameItem | GameMonster]
+    upload_fn,           # async (id, bytes, filename) -> (bool, str)
+    stop_kb_fn,          # () -> InlineKeyboardMarkup  (called fresh each time)
+    finish_kb_fn,        # () -> InlineKeyboardMarkup  (for final / cancelled state)
+    title:        str,   # e.g. "⚔️ <b>Генерація предметів MMORPG ROE</b>"
+    entity_word:  str,   # e.g. "Предметів" / "Монстрів"
+    entity_icon:  str,   # e.g. "📦" / "🐉"
+    fetch_msg:    str,   # e.g. "Отримую список предметів…"
+    empty_msg:    str,   # e.g. "Всі предмети вже мають зображення!"
+    stop_msg:     str,   # e.g. "Генерацію предметів зупинено"
+    done_header:  str,   # e.g. "⚔️ <b>Генерація предметів завершена!</b>"
+    per_slot_lbl: str,   # e.g. "на предмет" / "на монстра"
+    log_prefix:   str,   # e.g. "items_gen" / "monster_gen"
+) -> None:
     import time as _time
     from aiogram.types import BufferedInputFile
 
-    status_ref: list = [None]   # mutable holder so _gg_edit can replace it
+    status_ref: list = [None]
 
     async def _edit(text: str, **kw) -> None:
         await _gg_edit(status_ref, trigger_msg, text, **kw)
 
-    # ── wait for ComfyUI (initial check) ─────────────────────────────────
+    # ── wait for ComfyUI ─────────────────────────────────────────────────
     status_ref[0] = await trigger_msg.answer(
-        "🔄 Перевіряю ComfyUI…", reply_markup=_kb_game_stop(),
+        "🔄 Перевіряю ComfyUI…", reply_markup=stop_kb_fn(),
     )
-    await _gg_wait_for("ComfyUI", comfy_client.ping, _edit)
+    await _gg_wait_for("ComfyUI", comfy_client.ping, _edit, stop_kb=stop_kb_fn())
 
-    # ── wait for Game API + fetch items ───────────────────────────────────
-    await _edit("🔄 Отримую список предметів…",
-                parse_mode="HTML", reply_markup=_kb_game_stop())
+    # ── fetch entity list ────────────────────────────────────────────────
+    await _edit(f"🔄 {fetch_msg}", parse_mode="HTML", reply_markup=stop_kb_fn())
 
-    items: list[game_api.GameItem] = []
-    while not items:
-        await _gg_wait_for("Game API", _check_game_api, _edit)
+    entities = []
+    while not entities:
+        await _gg_wait_for("Game API", _check_game_api, _edit, stop_kb=stop_kb_fn())
         try:
-            items = await game_api.fetch_items()
+            entities = await fetch_fn()
         except asyncio.CancelledError:
             raise
         except Exception as exc:
-            log.warning("game_gen: fetch_items error: %s", exc)
-            items = []
+            log.warning("%s: fetch error: %s", log_prefix, exc)
             continue
-        if not items:
-            await _edit("✅ <b>Всі предмети вже мають зображення!</b>",
-                        parse_mode="HTML", reply_markup=kb_settings())
+        if not entities:
+            await _edit(f"✅ <b>{empty_msg}</b>",
+                        parse_mode="HTML", reply_markup=finish_kb_fn())
             return
 
-    if not items:
-        await _edit("✅ <b>Всі предмети вже мають зображення!</b>",
-                    parse_mode="HTML", reply_markup=kb_settings())
-        return
+    # ── prep ─────────────────────────────────────────────────────────────
+    total_count = len(entities)
+    total_slots = sum(e.slots_remaining for e in entities)
 
-    total_items = len(items)
-    total_slots = sum(i.slots_remaining for i in items)
     await _edit(
-        f"🎮 <b>Генерація предметів MMORPG</b>\n\n"
-        f"Предметів: <b>{total_items}</b>  •  Зображень: <b>{total_slots}</b>\n"
+        f"{title}\n\n"
+        f"{entity_word}: <b>{total_count}</b>  •  Зображень: <b>{total_slots}</b>\n"
         f"Модель: <b>{user_settings_ckpt_label(admin_user.id)}</b>\nПочинаю…",
-        parse_mode="HTML", reply_markup=_kb_game_stop(),
+        parse_mode="HTML", reply_markup=stop_kb_fn(),
     )
 
-    # ── gen settings ─────────────────────────────────────────────────────
     user_settings = dict(db.get_gen_settings(admin_user.id))
     _ckpt = user_settings.get("checkpoint") or config.CHECKPOINT
     user_settings["_workflow_type"] = models_db.get_workflow(_ckpt)
-    user_settings["mode"]       = "text2img"
-    user_settings["batch_size"] = 1
+    user_settings["mode"]           = "text2img"
+    user_settings["batch_size"]     = 1
 
     ok_count   = 0
     fail_count = 0
     fail_names: list[str] = []
     done_slots = 0
 
+    # ── main loop ─────────────────────────────────────────────────────────
     try:
-        for item_idx, item in enumerate(items, 1):
-            needed = item.slots_remaining
+        for idx, entity in enumerate(entities, 1):
+            needed = entity.slots_remaining
 
             for variant in range(1, needed + 1):
                 done_slots += 1
 
-                # ── progress header ───────────────────────────────────────
                 bar_fill    = int(20 * (done_slots - 1) / total_slots)
                 slots_bar   = "▓" * bar_fill + "░" * (20 - bar_fill)
-                rarity_tag  = f"  <i>[{item.rarity}]</i>" if item.rarity else ""
+                tag_str     = f"  <i>[{entity.tag}]</i>" if entity.tag else ""
                 variant_tag = f"  <i>варіант {variant}/{needed}</i>" if needed > 1 else ""
-                item_header = (
-                    f"🎮 <b>Генерація предметів MMORPG</b>\n\n"
+                hdr = (
+                    f"{title}\n\n"
                     f"<code>{slots_bar}</code>  {done_slots - 1}/{total_slots}\n"
-                    f"📦 {item_idx}/{total_items}  "
-                    f"⚙️ <b>{item.name}</b>{rarity_tag}{variant_tag}"
+                    f"{entity_icon} {idx}/{total_count}  "
+                    f"⚙️ <b>{entity.name}</b>{tag_str}{variant_tag}"
                 )
-                await _edit(item_header, parse_mode="HTML",
-                            reply_markup=_kb_game_stop())
+                await _edit(hdr, parse_mode="HTML", reply_markup=stop_kb_fn())
 
-                # ── on_progress ───────────────────────────────────────────
                 _last_upd = [0.0]
 
                 async def on_progress(step: int, total_steps: int,
-                                      _hdr: str = item_header) -> None:
+                                      _h: str = hdr) -> None:
                     now = _time.monotonic()
                     if now - _last_upd[0] < 1.0:
                         return
                     _last_upd[0] = now
-                    step_bar = comfy_client.progress_bar(step, total_steps)
                     await _edit(
-                        f"{_hdr}\n\n<code>{step_bar}</code>  крок {step}/{total_steps}",
-                        parse_mode="HTML", reply_markup=_kb_game_stop(),
+                        f"{_h}\n\n"
+                        f"<code>{comfy_client.progress_bar(step, total_steps)}</code>"
+                        f"  крок {step}/{total_steps}",
+                        parse_mode="HTML", reply_markup=stop_kb_fn(),
                     )
 
-                # ── generate (ComfyUI-wait + retry) ──────────────────────
+                # generate
                 try:
                     png_bytes = await _gg_generate(
-                        item.prompt, on_progress, user_settings, _edit,
+                        entity.prompt, on_progress, user_settings, _edit,
+                        stop_kb=stop_kb_fn(),
                     )
                 except asyncio.CancelledError:
                     raise
                 except Exception as exc:
-                    log.error("game_gen: generation failed %s v%d: %s",
-                              item.id, variant, exc)
+                    log.error("%s: generation failed %s v%d: %s",
+                              log_prefix, entity.id, variant, exc)
                     fail_count += 1
-                    fail_names.append(f"{item.name} v{variant} (gen: {str(exc)[:60]})")
+                    fail_names.append(f"{entity.name} v{variant} — gen: {exc!s:.60}")
                     continue
 
-                # ── convert to WebP ───────────────────────────────────────
+                # convert to WebP
                 try:
                     webp_bytes = await asyncio.get_running_loop().run_in_executor(
                         None, _to_webp, png_bytes,
                     )
                 except Exception as exc:
-                    log.warning("game_gen: WebP conversion failed %s: %s", item.id, exc)
+                    log.warning("%s: WebP conversion failed %s: %s",
+                                log_prefix, entity.id, exc)
                     webp_bytes = png_bytes
 
-                # ── show result ───────────────────────────────────────────
+                # show result photo
                 caption = (
-                    f"✅ <b>{item.name}</b>{rarity_tag}"
+                    f"✅ <b>{entity.name}</b>{tag_str}"
                     + (f"\nВаріант {variant}/{needed}" if needed > 1 else "")
-                    + f"\n<i>Предмет {item_idx}/{total_items}  •  Слот {done_slots}/{total_slots}</i>"
+                    + f"\n<i>{entity_word} {idx}/{total_count}  •  Слот {done_slots}/{total_slots}</i>"
                 )
                 try:
                     await trigger_msg.answer_photo(
-                        BufferedInputFile(png_bytes, filename=f"{item.id}_v{variant}.png"),
+                        BufferedInputFile(png_bytes, filename=f"{entity.id}_v{variant}.png"),
                         caption=caption, parse_mode="HTML",
                     )
                 except Exception as exc:
-                    log.warning("game_gen: send photo failed %s v%d: %s",
-                                item.id, variant, exc)
+                    log.warning("%s: send photo failed %s v%d: %s",
+                                log_prefix, entity.id, variant, exc)
 
-                # ── upload (Game API-wait + retry, inline with status) ────
-                await _edit(
-                    f"{item_header}\n\n⬆️ Завантажую на сервер…",
-                    parse_mode="HTML", reply_markup=_kb_game_stop(),
+                # upload
+                await _gg_bump_status(
+                    status_ref, trigger_msg,
+                    f"{hdr}\n\n⬆️ Завантажую на сервер…",
+                    parse_mode="HTML", reply_markup=stop_kb_fn(),
                 )
-                success, result = await _gg_upload(
-                    item.id, webp_bytes,
-                    f"{item.id}_v{variant}.webp",
+                ok, result = await _gg_upload(
+                    entity.id, webp_bytes,
+                    f"{entity.id}_v{variant}.webp",
+                    upload_fn=upload_fn,
+                    check_fn=_check_game_api,
                     edit_fn=_edit,
+                    stop_kb=stop_kb_fn(),
                 )
-                if success:
+                if ok:
                     ok_count += 1
-                    log.info("game_gen: ✓ %s v%d → %s", item.id, variant, result)
+                    log.info("%s: ✓ %s v%d → %s", log_prefix, entity.id, variant, result)
                 else:
                     fail_count += 1
-                    fail_names.append(f"{item.name} v{variant} (upload: {result[:60]})")
-                    log.warning("game_gen: ✗ %s v%d — %s", item.id, variant, result)
+                    fail_names.append(f"{entity.name} v{variant} — upload: {result:.60}")
+                    log.warning("%s: ✗ %s v%d — %s", log_prefix, entity.id, variant, result)
 
     except asyncio.CancelledError:
-        log.info("game_gen: cancelled — ok=%d fail=%d done=%d/%d",
-                 ok_count, fail_count, done_slots, total_slots)
+        log.info("%s: cancelled — ok=%d fail=%d done=%d/%d",
+                 log_prefix, ok_count, fail_count, done_slots, total_slots)
         await _edit(
-            f"⛔ <b>Генерацію зупинено</b>\n\n"
+            f"⛔ <b>{stop_msg}</b>\n\n"
             f"✅ Завантажено: <b>{ok_count}</b>\n"
             f"🖼 Зроблено: <b>{done_slots}</b> з <b>{total_slots}</b>",
-            parse_mode="HTML", reply_markup=kb_settings(),
+            parse_mode="HTML", reply_markup=finish_kb_fn(),
         )
         return
 
     # ── summary ───────────────────────────────────────────────────────────
-    summary_lines = [
-        "🎮 <b>Генерація предметів завершена!</b>\n",
+    lines = [
+        f"{done_header}\n",
         f"✅ Завантажено:  <b>{ok_count}</b>",
         f"❌ Помилок:     <b>{fail_count}</b>",
-        f"🖼 Зображень:   <b>{total_slots}</b>  (по {game_api.MAX_CANDIDATES} на предмет)",
-        f"📦 Предметів:   <b>{total_items}</b>",
+        f"🖼 Зображень:   <b>{total_slots}</b>  (по {game_api.MAX_CANDIDATES} {per_slot_lbl})",
+        f"{entity_icon} {entity_word}: <b>{total_count}</b>",
     ]
     if fail_names:
-        summary_lines.append("\n<b>Не вдалось:</b>")
-        for n in fail_names[:10]:
-            summary_lines.append(f"  • {n}")
+        lines.append("\n<b>Не вдалось:</b>")
+        lines += [f"  • {n}" for n in fail_names[:10]]
         if len(fail_names) > 10:
-            summary_lines.append(f"  … та ще {len(fail_names) - 10}")
+            lines.append(f"  … та ще {len(fail_names) - 10}")
 
-    await _edit("\n".join(summary_lines), parse_mode="HTML", reply_markup=kb_settings())
+    await _edit("\n".join(lines), parse_mode="HTML", reply_markup=finish_kb_fn())
+
+
+# ── thin wrappers ─────────────────────────────────────────────────────────
+
+async def _run_game_gen(trigger_msg: Message, admin_user) -> None:
+    await _run_gen_loop(
+        trigger_msg, admin_user,
+        fetch_fn      = game_api.fetch_items,
+        upload_fn     = game_api.upload_item_image,
+        stop_kb_fn    = _kb_items_stop,
+        finish_kb_fn  = lambda: kb_mmorpg_menu(items_running=False),
+        title         = "⚔️ <b>Генерація предметів MMORPG ROE</b>",
+        entity_word   = "Предметів",
+        entity_icon   = "📦",
+        fetch_msg     = "Отримую список предметів…",
+        empty_msg     = "Всі предмети вже мають зображення!",
+        stop_msg      = "Генерацію предметів зупинено",
+        done_header   = "⚔️ <b>Генерація предметів завершена!</b>",
+        per_slot_lbl  = "на предмет",
+        log_prefix    = "items_gen",
+    )
+
+
+async def _run_game_monster_gen(trigger_msg: Message, admin_user) -> None:
+    await _run_gen_loop(
+        trigger_msg, admin_user,
+        fetch_fn      = game_api.fetch_monsters,
+        upload_fn     = game_api.upload_monster_image,
+        stop_kb_fn    = _kb_monsters_stop,
+        finish_kb_fn  = lambda: kb_mmorpg_menu(monsters_running=False),
+        title         = "👹 <b>Генерація монстрів MMORPG ROE</b>",
+        entity_word   = "Монстрів",
+        entity_icon   = "🐉",
+        fetch_msg     = "Отримую список монстрів…",
+        empty_msg     = "Всі монстри вже мають зображення!",
+        stop_msg      = "Генерацію монстрів зупинено",
+        done_header   = "👹 <b>Генерація монстрів завершена!</b>",
+        per_slot_lbl  = "на монстра",
+        log_prefix    = "monster_gen",
+    )
+
+
+async def _run_game_npc_gen(trigger_msg: Message, admin_user) -> None:
+    await _run_gen_loop(
+        trigger_msg, admin_user,
+        fetch_fn      = game_api.fetch_npcs,
+        upload_fn     = game_api.upload_npc_image,
+        stop_kb_fn    = _kb_npcs_stop,
+        finish_kb_fn  = lambda: kb_mmorpg_menu(npcs_running=False),
+        title         = "🧙 <b>Генерація NPC MMORPG ROE</b>",
+        entity_word   = "NPC",
+        entity_icon   = "🧑",
+        fetch_msg     = "Отримую список NPC…",
+        empty_msg     = "Всі NPC вже мають зображення!",
+        stop_msg      = "Генерацію NPC зупинено",
+        done_header   = "🧙 <b>Генерація NPC завершена!</b>",
+        per_slot_lbl  = "на NPC",
+        log_prefix    = "npc_gen",
+    )
+
+
+async def _run_game_location_gen(trigger_msg: Message, admin_user) -> None:
+    await _run_gen_loop(
+        trigger_msg, admin_user,
+        fetch_fn      = game_api.fetch_locations,
+        upload_fn     = game_api.upload_location_image,
+        stop_kb_fn    = _kb_locations_stop,
+        finish_kb_fn  = lambda: kb_mmorpg_menu(locations_running=False),
+        title         = "🗺️ <b>Генерація локацій MMORPG ROE</b>",
+        entity_word   = "Локацій",
+        entity_icon   = "📍",
+        fetch_msg     = "Отримую список локацій…",
+        empty_msg     = "Всі локації вже мають зображення!",
+        stop_msg      = "Генерацію локацій зупинено",
+        done_header   = "🗺️ <b>Генерація локацій завершена!</b>",
+        per_slot_lbl  = "на локацію",
+        log_prefix    = "location_gen",
+    )
+
+
+# ── video generation loop ─────────────────────────────────────────────────
+
+async def _run_video_gen_loop(
+    trigger_msg,
+    admin_user,
+    *,
+    fetch_fn,
+    upload_fn,
+    stop_kb_fn,
+    finish_kb_fn,
+    title:       str,
+    entity_word: str,
+    entity_icon: str,
+    fetch_msg:   str,
+    empty_msg:   str,
+    stop_msg:    str,
+    done_header: str,
+    log_prefix:  str,
+) -> None:
+    import time as _time
+    from aiogram.types import BufferedInputFile
+
+    status_ref: list = [None]
+
+    async def _edit(text: str, **kw) -> None:
+        await _gg_edit(status_ref, trigger_msg, text, **kw)
+
+    # ── check video model ────────────────────────────────────────────────
+    user_settings = dict(db.get_gen_settings(admin_user.id))
+    if not user_settings.get("video_model"):
+        status_ref[0] = await trigger_msg.answer(
+            "❌ <b>Відео-модель не обрана!</b>\n\n"
+            "Перейдіть у <b>🎬 Генерація відео → ⚙️ Налаштування відео</b> та оберіть модель.",
+            parse_mode="HTML", reply_markup=finish_kb_fn(),
+        )
+        return
+
+    # ── wait for ComfyUI ─────────────────────────────────────────────────
+    status_ref[0] = await trigger_msg.answer(
+        "🔄 Перевіряю ComfyUI…", reply_markup=stop_kb_fn(),
+    )
+    await _gg_wait_for("ComfyUI", comfy_client.ping, _edit, stop_kb=stop_kb_fn())
+
+    # ── fetch entity list ────────────────────────────────────────────────
+    await _edit(
+        f"🔄 {fetch_msg}\n<i>Завантажую зображення для анімації…</i>",
+        parse_mode="HTML", reply_markup=stop_kb_fn(),
+    )
+
+    entities = []
+    while not entities:
+        await _gg_wait_for("Game API", _check_game_api, _edit, stop_kb=stop_kb_fn())
+        try:
+            entities = await fetch_fn()
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            log.warning("%s: fetch error: %s", log_prefix, exc)
+            continue
+        if not entities:
+            await _edit(f"✅ <b>{empty_msg}</b>",
+                        parse_mode="HTML", reply_markup=finish_kb_fn())
+            return
+
+    total_count = len(entities)
+    total_slots = sum(e.slots_remaining for e in entities)
+
+    frames = int(user_settings.get("video_frames") or 25)
+    fps    = float(user_settings.get("video_fps") or 8)
+    steps  = int(user_settings.get("video_steps") or 25)
+    model  = user_settings.get("video_model", "—")
+
+    await _edit(
+        f"{title}\n\n"
+        f"{entity_word}: <b>{total_count}</b>  •  Анімацій: <b>{total_slots}</b>\n"
+        f"Модель: <b>{_short(model)}</b>  •  {frames}к / {fps}fps / {steps}кр\n"
+        f"Режим: <b>🖼→🎬 зображення → анімація</b>\nПочинаю…",
+        parse_mode="HTML", reply_markup=stop_kb_fn(),
+    )
+
+    ok_count   = 0
+    fail_count = 0
+    fail_names: list[str] = []
+    done_slots = 0
+
+    # ── main loop ─────────────────────────────────────────────────────────
+    try:
+        for idx, entity in enumerate(entities, 1):
+            needed = entity.slots_remaining
+
+            for variant in range(1, needed + 1):
+                done_slots += 1
+
+                bar_fill  = int(20 * (done_slots - 1) / total_slots)
+                slots_bar = "▓" * bar_fill + "░" * (20 - bar_fill)
+                tag_str   = f"  <i>[{entity.tag}]</i>" if entity.tag else ""
+                var_tag   = f"  <i>варіант {variant}/{needed}</i>" if needed > 1 else ""
+                hdr = (
+                    f"{title}\n\n"
+                    f"<code>{slots_bar}</code>  {done_slots - 1}/{total_slots}\n"
+                    f"{entity_icon} {idx}/{total_count}  "
+                    f"⚙️ <b>{entity.name}</b>{tag_str}{var_tag}"
+                )
+                await _edit(hdr, parse_mode="HTML", reply_markup=stop_kb_fn())
+
+                # ── download source image ───────────────────────────────
+                try:
+                    source_image = await game_api.download_image(entity.image_url)
+                except asyncio.CancelledError:
+                    raise
+                except Exception as exc:
+                    log.error("%s: image download failed %s: %s", log_prefix, entity.id, exc)
+                    fail_count += 1
+                    fail_names.append(f"{entity.name} — download: {exc!s:.60}")
+                    continue
+
+                _last_upd = [0.0]
+
+                async def on_progress(step: int, total_steps: int,
+                                      _h: str = hdr) -> None:
+                    now = _time.monotonic()
+                    if now - _last_upd[0] < 3.0:
+                        return
+                    _last_upd[0] = now
+                    await _edit(
+                        f"{_h}\n\n"
+                        f"<code>{comfy_client.progress_bar(step, total_steps)}</code>"
+                        f"  крок {step}/{total_steps}",
+                        parse_mode="HTML", reply_markup=stop_kb_fn(),
+                    )
+
+                # ── generate animation from image (img2video) ───────────
+                await _gg_wait_for("ComfyUI", comfy_client.ping, _edit, stop_kb=stop_kb_fn())
+                try:
+                    vid_bytes = await comfy_client.generate_video(
+                        entity.prompt,
+                        on_progress=on_progress,
+                        user_settings=user_settings,
+                        input_image=source_image,
+                    )
+                except asyncio.CancelledError:
+                    raise
+                except Exception as exc:
+                    log.error("%s: animation failed %s v%d: %s",
+                              log_prefix, entity.id, variant, exc)
+                    fail_count += 1
+                    fail_names.append(f"{entity.name} v{variant} — gen: {exc!s:.60}")
+                    continue
+
+                # ── show result in chat ─────────────────────────────────
+                caption = (
+                    f"🎬 <b>{entity.name}</b>{tag_str}"
+                    + (f"\nВаріант {variant}/{needed}" if needed > 1 else "")
+                    + f"\n<i>{entity_word} {idx}/{total_count}  •  Слот {done_slots}/{total_slots}</i>"
+                )
+                try:
+                    await trigger_msg.answer_animation(
+                        BufferedInputFile(vid_bytes, filename=f"{entity.id}_v{variant}.webp"),
+                        caption=caption, parse_mode="HTML",
+                    )
+                except Exception as exc:
+                    try:
+                        await trigger_msg.answer_document(
+                            BufferedInputFile(vid_bytes, filename=f"{entity.id}_v{variant}.webp"),
+                            caption=caption, parse_mode="HTML",
+                        )
+                    except Exception:
+                        log.warning("%s: send animation failed %s v%d: %s",
+                                    log_prefix, entity.id, variant, exc)
+
+                # ── upload to game server ───────────────────────────────
+                await _gg_bump_status(
+                    status_ref, trigger_msg,
+                    f"{hdr}\n\n⬆️ Завантажую анімацію на сервер…",
+                    parse_mode="HTML", reply_markup=stop_kb_fn(),
+                )
+                ok, result = await _gg_upload(
+                    entity.id, vid_bytes,
+                    f"{entity.id}_v{variant}.webp",
+                    upload_fn=upload_fn,
+                    check_fn=_check_game_api,
+                    edit_fn=_edit,
+                    stop_kb=stop_kb_fn(),
+                )
+                if ok:
+                    ok_count += 1
+                    log.info("%s: ✓ %s v%d → %s", log_prefix, entity.id, variant, result)
+                else:
+                    fail_count += 1
+                    fail_names.append(f"{entity.name} v{variant} — upload: {result:.60}")
+                    log.warning("%s: ✗ %s v%d — %s", log_prefix, entity.id, variant, result)
+
+    except asyncio.CancelledError:
+        log.info("%s: cancelled — ok=%d fail=%d done=%d/%d",
+                 log_prefix, ok_count, fail_count, done_slots, total_slots)
+        await _edit(
+            f"⛔ <b>{stop_msg}</b>\n\n"
+            f"✅ Завантажено: <b>{ok_count}</b>\n"
+            f"🎬 Зроблено: <b>{done_slots}</b> з <b>{total_slots}</b>",
+            parse_mode="HTML", reply_markup=finish_kb_fn(),
+        )
+        return
+
+    # ── summary ───────────────────────────────────────────────────────────
+    lines = [
+        f"{done_header}\n",
+        f"✅ Завантажено:  <b>{ok_count}</b>",
+        f"❌ Помилок:     <b>{fail_count}</b>",
+        f"🎬 Анімацій:    <b>{total_slots}</b>",
+        f"{entity_icon} {entity_word}: <b>{total_count}</b>",
+    ]
+    if fail_names:
+        lines.append("\n<b>Не вдалось:</b>")
+        lines += [f"  • {n}" for n in fail_names[:10]]
+        if len(fail_names) > 10:
+            lines.append(f"  … та ще {len(fail_names) - 10}")
+
+    await _edit("\n".join(lines), parse_mode="HTML", reply_markup=finish_kb_fn())
+
+
+# ── animated thin wrappers ────────────────────────────────────────────────
+
+async def _run_game_vid_gen(trigger_msg: Message, admin_user) -> None:
+    await _run_video_gen_loop(
+        trigger_msg, admin_user,
+        fetch_fn     = game_api.fetch_items_animated,
+        upload_fn    = game_api.upload_item_animated,
+        stop_kb_fn   = _kb_items_vid_stop,
+        finish_kb_fn = lambda: kb_mmorpg_menu(items_vid_running=False),
+        title        = "🎬 ⚔️ <b>Анімація предметів MMORPG ROE</b>",
+        entity_word  = "Предметів",
+        entity_icon  = "📦",
+        fetch_msg    = "Отримую предмети та їх зображення…",
+        empty_msg    = "Всі предмети вже мають анімацію!",
+        stop_msg     = "Генерацію анімації предметів зупинено",
+        done_header  = "🎬 ⚔️ <b>Анімація предметів завершена!</b>",
+        log_prefix   = "items_vid_gen",
+    )
+
+
+async def _run_game_vid_monster_gen(trigger_msg: Message, admin_user) -> None:
+    await _run_video_gen_loop(
+        trigger_msg, admin_user,
+        fetch_fn     = game_api.fetch_monsters_animated,
+        upload_fn    = game_api.upload_monster_animated,
+        stop_kb_fn   = _kb_monsters_vid_stop,
+        finish_kb_fn = lambda: kb_mmorpg_menu(monsters_vid_running=False),
+        title        = "🎬 👹 <b>Анімація монстрів MMORPG ROE</b>",
+        entity_word  = "Монстрів",
+        entity_icon  = "🐉",
+        fetch_msg    = "Отримую монстрів та їх зображення…",
+        empty_msg    = "Всі монстри вже мають анімацію!",
+        stop_msg     = "Генерацію анімації монстрів зупинено",
+        done_header  = "🎬 👹 <b>Анімація монстрів завершена!</b>",
+        log_prefix   = "monsters_vid_gen",
+    )
+
+
+async def _run_game_vid_npc_gen(trigger_msg: Message, admin_user) -> None:
+    await _run_video_gen_loop(
+        trigger_msg, admin_user,
+        fetch_fn     = game_api.fetch_npcs_animated,
+        upload_fn    = game_api.upload_npc_animated,
+        stop_kb_fn   = _kb_npcs_vid_stop,
+        finish_kb_fn = lambda: kb_mmorpg_menu(npcs_vid_running=False),
+        title        = "🎬 🧙 <b>Анімація NPC MMORPG ROE</b>",
+        entity_word  = "NPC",
+        entity_icon  = "🧑",
+        fetch_msg    = "Отримую NPC та їх зображення…",
+        empty_msg    = "Всі NPC вже мають анімацію!",
+        stop_msg     = "Генерацію анімації NPC зупинено",
+        done_header  = "🎬 🧙 <b>Анімація NPC завершена!</b>",
+        log_prefix   = "npcs_vid_gen",
+    )
+
+
+async def _run_game_vid_location_gen(trigger_msg: Message, admin_user) -> None:
+    await _run_video_gen_loop(
+        trigger_msg, admin_user,
+        fetch_fn     = game_api.fetch_locations_animated,
+        upload_fn    = game_api.upload_location_animated,
+        stop_kb_fn   = _kb_locations_vid_stop,
+        finish_kb_fn = lambda: kb_mmorpg_menu(locations_vid_running=False),
+        title        = "🎬 🗺️ <b>Анімація локацій MMORPG ROE</b>",
+        entity_word  = "Локацій",
+        entity_icon  = "📍",
+        fetch_msg    = "Отримую локації та їх зображення…",
+        empty_msg    = "Всі локації вже мають анімацію!",
+        stop_msg     = "Генерацію анімації локацій зупинено",
+        done_header  = "🎬 🗺️ <b>Анімація локацій завершена!</b>",
+        log_prefix   = "locations_vid_gen",
+    )
+
+
+async def _run_game_skill_gen(trigger_msg: Message, admin_user) -> None:
+    await _run_gen_loop(
+        trigger_msg, admin_user,
+        fetch_fn     = game_api.fetch_skills,
+        upload_fn    = game_api.upload_skill_image,
+        stop_kb_fn   = _kb_skills_stop,
+        finish_kb_fn = lambda: kb_mmorpg_menu(skills_running=False),
+        title        = "✨ <b>Генерація скілів MMORPG ROE</b>",
+        entity_word  = "Скілів",
+        entity_icon  = "⚡",
+        fetch_msg    = "Отримую список скілів…",
+        empty_msg    = "Всі скіли вже мають зображення!",
+        stop_msg     = "Генерацію скілів зупинено",
+        done_header  = "✨ <b>Генерація скілів завершена!</b>",
+        per_slot_lbl = "на скіл",
+        log_prefix   = "skill_gen",
+    )
+
+
+async def _run_game_vid_skill_gen(trigger_msg: Message, admin_user) -> None:
+    await _run_video_gen_loop(
+        trigger_msg, admin_user,
+        fetch_fn     = game_api.fetch_skills_animated,
+        upload_fn    = game_api.upload_skill_animated,
+        stop_kb_fn   = _kb_skills_vid_stop,
+        finish_kb_fn = lambda: kb_mmorpg_menu(skills_vid_running=False),
+        title        = "🎬 ✨ <b>Анімація скілів MMORPG ROE</b>",
+        entity_word  = "Скілів",
+        entity_icon  = "⚡",
+        fetch_msg    = "Отримую скіли та їх зображення…",
+        empty_msg    = "Всі скіли вже мають анімацію!",
+        stop_msg     = "Генерацію анімації скілів зупинено",
+        done_header  = "🎬 ✨ <b>Анімація скілів завершена!</b>",
+        log_prefix   = "skills_vid_gen",
+    )
 
 
 def user_settings_ckpt_label(tg_id: int) -> str:
@@ -3842,6 +5261,9 @@ async def _set_commands() -> None:
     """Register bot commands so they appear in the Telegram command menu."""
     user_commands = [
         BotCommand(command="start",    description="🏠 Головне меню"),
+        BotCommand(command="qwen",     description="🌀 Qwen-Image 2.1"),
+        BotCommand(command="music",    description="🎵 Музика та звуки"),
+        BotCommand(command="voice",    description="🗣 Голос, озвучка, клонування"),
         BotCommand(command="gen",      description="🎨 Згенерувати зображення"),
         BotCommand(command="settings", description="🎛 Налаштування генерації"),
         BotCommand(command="history",  description="📜 Моя історія зображень"),
@@ -3865,6 +5287,9 @@ async def main() -> None:
             f"⚠️ <b>ComfyUI недоступний при старті бота!</b>\n<code>{config.COMFY_URL}</code>"
         )
     log.info("Bot started. Model: %s", config.CHECKPOINT)
+    dp.include_router(qwen_ui.router)
+    dp.include_router(music_ui.router)
+    dp.include_router(voice_ui.router)
     await dp.start_polling(bot)
 
 if __name__ == "__main__":

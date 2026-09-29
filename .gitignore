@@ -50,3 +50,6 @@ nssm.exe
 
 # Claude Code
 .claude/
+
+# Cloned voice samples (personal data)
+voices/

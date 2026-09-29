@@ -1,0 +1,24 @@
+services:
+  comfyui:
+    image: comfyui-local:cu130-voice
+    container_name: comfyui
+    restart: unless-stopped
+    runtime: nvidia
+    environment:
+      - NVIDIA_VISIBLE_DEVICES=all
+      - NVIDIA_DRIVER_CAPABILITIES=compute,utility
+      - HF_HOME=/app/models/omnivoice
+    ports:
+      - "8188:8188"
+    volumes:
+      - /mnt/docker/comfyui/models:/app/models
+      - /mnt/docker/comfyui/output:/app/output
+      - /mnt/docker/comfyui/input:/app/input
+      - /mnt/docker/comfyui/user:/app/user
+      - /mnt/docker/comfyui/custom_nodes/comfyui_voice:/app/custom_nodes/comfyui_voice:ro
+      - /mnt/docker/comfyui/seed-vc:/opt/seed-vc:ro
+      - /mnt/docker/comfyui/models/seedvc:/app/checkpoints
+    command: ["python3","main.py","--listen","0.0.0.0","--port","8188","--preview-method","latent2rgb"]
+    logging:
+      driver: json-file
+      options: {max-size: "50m", max-file: "3"}
