@@ -1419,8 +1419,13 @@ def voice_settings(s: dict) -> dict:
 
 
 def voice_estimate(chars: int, m: dict, s2s: bool = False) -> float:
-    # model move to GPU dominates; synthesis ~0.02-0.05 s per char depending on steps
-    return 12 + chars * 0.012 * m["num_step"] / 32 + (8 if s2s else 0)
+    # measured on RTX 3050: ~0.028 s per character at 32 steps (≈35 chars/s), plus model move
+    return 10 + chars * 0.028 * m["num_step"] / 32 + (8 if s2s else 0)
+
+
+def _opus_bitrate(chars: int) -> str:
+    """Keep long narrations under Telegram's 50 MB bot upload limit (~1 MB per minute at 128k)."""
+    return "128k" if chars <= 12000 else "96k" if chars <= 20000 else "64k" if chars <= 45000 else "48k"
 
 
 def _tts_node(text_src, m: dict, seed: int, ref: Optional[list], ref_text: str, instruct: str) -> dict:
@@ -1468,9 +1473,11 @@ async def generate_speech(
     seed = int(voice.get("seed") or (uuid.uuid4().int & 0xFFFFFFFF))
     wf["4"] = _tts_node(text_src, m, seed, ref, voice.get("ref_text", ""), voice.get("instruct", ""))
     wf["5"] = {"class_type": "SaveAudioOpus",
-               "inputs": {"audio": ["4", 0], "filename_prefix": "audio/tgbot_voice", "quality": "128k"}}
+               "inputs": {"audio": ["4", 0], "filename_prefix": "audio/tgbot_voice",
+                          "quality": _opus_bitrate(len(text or ""))}}
     eta = voice_estimate(len(text) if text else 200, m, source_audio is not None)
-    data = await run_workflow_rich(wf, VOICE_STAGES, 1, eta, on_status, config.QWEN_POLL_TIMEOUT, "audio")
+    data = await run_workflow_rich(wf, VOICE_STAGES, 1, eta, on_status,
+                                   max(config.QWEN_POLL_TIMEOUT, eta * 3), "audio")
     spoken = "\n".join(run_workflow_rich.last_state.get("texts") or []) or text
     return data, spoken
 

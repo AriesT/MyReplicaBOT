@@ -31,7 +31,8 @@ router = Router(name="voice")
 TITLE      = "🗣 <b>Голос і мовлення</b>"
 VOICES_DIR = Path(__file__).parent / "voices"
 MAX_VOICES = 12
-MAX_TEXT   = 3000
+MAX_TEXT   = 60000          # ≈8 500 words: ≈60 min of speech, ≈28 min of GPU time on RTX 3050
+TG_MSG_MAX = 4096           # Telegram's own limit for one text message
 
 
 class VoiceCB(CallbackData, prefix="vo"):
@@ -416,8 +417,11 @@ async def cb_tts(call: CallbackQuery, state: FSMContext) -> None:
     await state.set_state(VoiceState.tts_text)
     name, _ = _resolve_voice(call.from_user.id)
     await call.answer()
-    await _nav(call, f"🔊 <b>Озвучення</b> · {name}\n\nНадішліть текст (до {MAX_TEXT} символів).\n"
-                     "<i>Порада: розділові знаки = паузи та інтонація.</i>",
+    await _nav(call, f"🔊 <b>Озвучення</b> · {name}\n\n"
+                     f"Надішліть текст повідомленням (до {TG_MSG_MAX} символів — ліміт Telegram) "
+                     f"або <b>файлом .txt / .docx</b> (до {MAX_TEXT:,} символів ≈ 8 500 слів, "
+                     f"≈ {MAX_TEXT // 950} хв аудіо).\n"
+                     "<i>Порада: розділові знаки = паузи та інтонація.</i>".replace(",", " "),
                parse_mode="HTML", reply_markup=_kb_back())
 
 
@@ -425,6 +429,80 @@ async def cb_tts(call: CallbackQuery, state: FSMContext) -> None:
 async def handle_tts_text(message: Message, state: FSMContext) -> None:
     await state.clear()
     await speak(message, message.from_user, message.text.strip())
+
+
+_TEXT_EXT = (".txt", ".md", ".srt", ".text", ".docx")
+
+
+def _docx_text(raw: bytes) -> str:
+    """Plain text of a .docx (paragraphs → lines) using only the standard library."""
+    import io
+    import re as _re
+    import zipfile
+    from xml.etree import ElementTree as ET
+    ns = "{http://schemas.openxmlformats.org/wordprocessingml/2006/main}"
+    with zipfile.ZipFile(io.BytesIO(raw)) as z:
+        root = ET.fromstring(z.read("word/document.xml"))
+    lines = []
+    for p in root.iter(f"{ns}p"):
+        parts = []
+        for node in p.iter():
+            if node.tag == f"{ns}t" and node.text:
+                parts.append(node.text)
+            elif node.tag in (f"{ns}tab",):
+                parts.append(" ")
+            elif node.tag in (f"{ns}br", f"{ns}cr"):
+                parts.append("\n")
+        lines.append("".join(parts))
+    return _re.sub(r"\n{3,}", "\n\n", "\n".join(lines)).strip()
+
+
+async def _read_text_file(message: Message) -> Optional[str]:
+    doc = message.document
+    name = (doc.file_name or "").lower() if doc else ""
+    if doc is None or not name.endswith(_TEXT_EXT):
+        return None
+    if (doc.file_size or 0) > 20_000_000:
+        await message.answer("📄 Файл завеликий (макс. 20 МБ).")
+        return ""
+    f = await message.bot.get_file(doc.file_id)
+    raw = (await message.bot.download_file(f.file_path)).read()
+    if name.endswith(".docx"):
+        try:
+            return _docx_text(raw)
+        except Exception:
+            log.exception("docx parse failed")
+            await message.answer("📄 Не вдалося прочитати .docx — збережіть як .txt і надішліть ще раз.")
+            return ""
+    for enc in ("utf-8-sig", "cp1251", "utf-16"):
+        try:
+            return raw.decode(enc).strip()
+        except UnicodeDecodeError:
+            continue
+    await message.answer("📄 Не вдалося прочитати файл — збережіть його в UTF-8.")
+    return ""
+
+
+@router.message(VoiceState.tts_text, F.document)
+async def handle_tts_file(message: Message, state: FSMContext) -> None:
+    text = await _read_text_file(message)
+    if text is None:
+        await message.answer("📄 Надішліть текст або файл .txt / .docx / .md / .srt")
+        return
+    await state.clear()
+    if text:
+        await speak(message, message.from_user, text)
+
+
+@router.message(StateFilter(None), F.document)
+async def handle_text_file_anywhere(message: Message) -> None:
+    """In voice mode a .txt file is read aloud."""
+    allowed, _ = _ctx(message.from_user)
+    if not allowed or not is_active(message.from_user.id):
+        return
+    text = await _read_text_file(message)
+    if text:
+        await speak(message, message.from_user, text)
 
 
 @router.callback_query(VoiceCB.filter(F.action == "s2s"))
@@ -510,7 +588,13 @@ def _progress_text(info: dict, st: dict) -> str:
             icon = "🔄"
         else:
             icon = "✅"
-        lines.append(f"{icon} {label}")
+        extra = ""
+        if key == cur == "sample" and not info.get("vc"):
+            tot = st.get("stage_total") or st.get("total") or 0
+            done = st.get("stage_step") or st.get("step") or 0
+            if tot > 2:                       # 1 = preparing the voice, then one step per text fragment
+                extra = f" — фрагмент <b>{max(done - 1, 0)}/{tot - 1}</b>"
+        lines.append(f"{icon} {label}{extra}")
     frac = _frac(st)
     filled = int(round(16 * frac))
     lines += ["", f"<code>{'▰' * filled}{'▱' * (16 - filled)}  {int(frac * 100)}%</code>",
@@ -526,7 +610,8 @@ async def speak(message: Message, user, text: str, source_audio: Optional[bytes]
     if source_audio is None and not text:
         return
     if len(text) > MAX_TEXT:
-        await message.answer(f"✂️ Задовгий текст: {len(text)} символів, максимум {MAX_TEXT}.")
+        await message.answer(f"✂️ Задовгий текст: {len(text):,} символів ({len(text.split()):,} слів), "
+                             f"максимум {MAX_TEXT:,} (≈8 500 слів). Розбийте його на частини.".replace(",", " "))
         return
     m = cc.voice_settings(db.get_gen_settings(user.id))
     if source_audio is not None:
@@ -539,6 +624,12 @@ async def speak(message: Message, user, text: str, source_audio: Optional[bytes]
     if vc:
         eta = 40 if voice.get("ref") else 55
 
+    if len(text) > TG_MSG_MAX:
+        words = len(text.split())
+        await message.answer(f"📄 Прийнято {words:,} слів ({len(text):,} символів) ≈ {len(text) // 950} хв аудіо.\n"
+                             f"⏱ Генерація триватиме ~{_fmt(eta)} — прогрес за фрагментами буде видно нижче.\n"
+                             "<i>Порада: «⚡ Швидко» в налаштуваннях вдвічі скорочує час.</i>".replace(",", " "),
+                             parse_mode="HTML")
     ahead = gq.queue_len()
     status = await message.answer(f"🕐 В черзі — попереду {ahead} {gq._inflect(ahead)}" if ahead
                                   else f"⏳ Готую… <i>(~{_fmt(eta)})</i>", parse_mode="HTML")
