@@ -1506,7 +1506,8 @@ async def convert_voice(
     src = await _upload_audio(source_audio, f"tgbot_vc_{uuid.uuid4().hex[:8]}.ogg")
     wf: dict = {"2": {"class_type": "LoadAudio", "inputs": {"audio": src}}}
     if voice.get("ref"):
-        tgt = await _upload_audio(voice["ref"], f"tgbot_vct_{uuid.uuid4().hex[:8]}.ogg")
+        # Seed-VC benefits from a longer (~25 s) reference than OmniVoice (~10 s)
+        tgt = await _upload_audio(voice.get("ref_vc") or voice["ref"], f"tgbot_vct_{uuid.uuid4().hex[:8]}.ogg")
         wf["6"] = {"class_type": "LoadAudio", "inputs": {"audio": tgt}}
         target = ["6", 0]
     else:
@@ -1523,3 +1524,13 @@ async def convert_voice(
     # source loading and sample synthesis run in arbitrary order: show them as one stage for presets
     stages = VC_STAGES if voice.get("ref") else dict(VC_STAGES, **{"2": "encode"})
     return await run_workflow_rich(wf, stages, 1, 45, on_status, config.QWEN_POLL_TIMEOUT, "audio")
+
+
+async def select_voice_ref(data: bytes, seconds: float) -> bytes:
+    """Cut the cleanest `seconds`-long stretch of speech out of a long recording (OGG/Opus)."""
+    name = await _upload_audio(data, f"tgbot_ref_{uuid.uuid4().hex[:8]}.ogg")
+    wf = {"2": {"class_type": "LoadAudio", "inputs": {"audio": name}},
+          "4": {"class_type": "VoiceRefSelect", "inputs": {"audio": ["2", 0], "seconds": float(seconds)}},
+          "5": {"class_type": "SaveAudioOpus",
+                "inputs": {"audio": ["4", 0], "filename_prefix": "audio/tgbot_ref", "quality": "128k"}}}
+    return await run_workflow_rich(wf, VOICE_STAGES, 1, 10, None, 300, "audio")

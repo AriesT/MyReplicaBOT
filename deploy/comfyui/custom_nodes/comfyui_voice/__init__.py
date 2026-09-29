@@ -362,12 +362,89 @@ class SeedVCConvert:
         return ({"waveform": wav, "sample_rate": sr},)
 
 
+# ── picking the best reference clip from a long recording ────────────────
+
+def _best_window(wav: np.ndarray, sr: int, seconds: float) -> tuple[int, int]:
+    """Return (start, end) samples of the cleanest `seconds`-long stretch of speech.
+
+    Frames of 20 ms are classified as speech by energy relative to the recording's own
+    loud level. A window scores high when it is mostly speech, has few long pauses and
+    no clipping. Boundaries are then moved to the nearest quiet frame so words are not cut.
+    """
+    hop = int(sr * 0.02)
+    n = len(wav) // hop
+    want = int(seconds * sr)
+    if n < 3 or len(wav) <= want:
+        return 0, len(wav)
+    frames = wav[: n * hop].reshape(n, hop)
+    rms = np.sqrt((frames ** 2).mean(axis=1) + 1e-12)
+    loud = np.percentile(rms, 95)
+    speech = rms > max(loud * 0.08, 1e-4)
+    clipped = (np.abs(frames) > 0.99).mean(axis=1) > 0.001
+    w = int(seconds / 0.02)
+    best, best_score = 0, -1e9
+    step = max(1, int(0.25 / 0.02))
+    for i in range(0, n - w + 1, step):
+        sp = speech[i:i + w]
+        ratio = sp.mean()
+        # longest pause inside the window (seconds)
+        gaps, run = 0, 0
+        for f in sp:
+            run = 0 if f else run + 1
+            gaps = max(gaps, run)
+        score = ratio - 0.15 * max(0.0, gaps * 0.02 - 0.6) - 2.0 * clipped[i:i + w].mean()
+        if score > best_score:
+            best, best_score = i, score
+    start, end = best, best + w
+
+    def quiet_near(idx: int, direction: int) -> int:
+        for k in range(0, int(0.6 / 0.02)):
+            j = idx + direction * k
+            if 0 <= j < n and not speech[j]:
+                return j
+        return idx
+
+    start = quiet_near(start, -1)
+    end = min(n, quiet_near(end, +1))
+    return start * hop, end * hop
+
+
+class VoiceRefSelect:
+    """Long recording → the best short reference clip for cloning (3–10 s for OmniVoice,
+    up to ~25 s for Seed-VC). Also trims leading/trailing silence."""
+
+    @classmethod
+    def INPUT_TYPES(cls):
+        return {"required": {"audio": ("AUDIO",),
+                             "seconds": ("FLOAT", {"default": 10.0, "min": 3.0, "max": 30.0, "step": 0.5})}}
+
+    RETURN_TYPES = ("AUDIO",)
+    FUNCTION = "run"
+    CATEGORY = "audio/omnivoice"
+
+    def run(self, audio, seconds):
+        wav, sr = _to_mono(audio)
+        x = wav.squeeze(0).numpy().astype(np.float32)
+        peak = float(np.abs(x).max()) or 1.0
+        s, e = _best_window(x / peak, sr, seconds)
+        clip = x[s:e]
+        fade = int(sr * 0.01)
+        if len(clip) > 2 * fade:
+            ramp = np.linspace(0.0, 1.0, fade, dtype=np.float32)
+            clip[:fade] *= ramp
+            clip[-fade:] *= ramp[::-1]
+        log.info("VoiceRefSelect: %.1fs of %.1fs (from %.1fs)", len(clip) / sr, len(x) / sr, s / sr)
+        return ({"waveform": torch.from_numpy(clip.copy()).view(1, 1, -1), "sample_rate": sr},)
+
+
 NODE_CLASS_MAPPINGS = {
+    "VoiceRefSelect": VoiceRefSelect,
     "OmniVoiceTTS": OmniVoiceTTS,
     "OmniVoiceTranscribe": OmniVoiceTranscribe,
     "SeedVCConvert": SeedVCConvert,
 }
 NODE_DISPLAY_NAME_MAPPINGS = {
+    "VoiceRefSelect": "Voice Reference Select (best clip)",
     "OmniVoiceTTS": "OmniVoice TTS / Voice Clone",
     "OmniVoiceTranscribe": "OmniVoice Transcribe (Whisper)",
     "SeedVCConvert": "Seed-VC Voice Conversion (keeps intonation)",

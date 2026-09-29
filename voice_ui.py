@@ -32,6 +32,9 @@ router = Router(name="voice")
 TITLE      = "🗣 <b>Голос і мовлення</b>"
 VOICES_DIR = Path(__file__).parent / "voices"
 MAX_VOICES = 12
+MAX_CLONE_SEC = 300         # accept up to 5 min of reading for cloning
+REF_TTS_SEC   = 10.0        # OmniVoice: 3–10 s reference is best (longer = slower and worse)
+REF_VC_SEC    = 25.0        # Seed-VC uses up to ~25 s of reference
 MAX_TEXT   = 60000          # ≈8 500 words: ≈60 min of speech, ≈28 min of GPU time on RTX 3050
 TG_MSG_MAX = 4096           # Telegram's own limit for one text message
 
@@ -108,7 +111,9 @@ def _resolve_voice(tg_id: int, key: Optional[str] = None) -> tuple[str, dict]:
     if key.startswith("my:"):
         for v in _my_voices(tg_id):
             if v["id"] == key[3:]:
+                vc = v.get("file_vc")
                 return f"🧬 {v['name']}", {"ref": Path(v["file"]).read_bytes(), "ref_text": v.get("ref_text", ""),
+                                           "ref_vc": Path(vc).read_bytes() if vc and Path(vc).exists() else None,
                                            "seed": 7}
     pid = key[7:] if key.startswith("preset:") else "f_young"
     label, instruct, seed = cc.VOICE_PRESETS.get(pid, cc.VOICE_PRESETS["f_young"])
@@ -309,7 +314,9 @@ async def cb_del(call: CallbackQuery, callback_data: VoiceCB) -> None:
     keep = []
     for v in _my_voices(uid):
         if v["id"] == callback_data.value:
-            Path(v["file"]).unlink(missing_ok=True)
+            for field in ("file", "file_vc", "file_full"):
+                if v.get(field):
+                    Path(v[field]).unlink(missing_ok=True)
         else:
             keep.append(v)
     _save_voices(uid, keep)
@@ -345,9 +352,11 @@ async def cb_clone_ok(call: CallbackQuery, state: FSMContext) -> None:
     await state.set_state(VoiceState.clone_audio)
     await call.answer()
     await _nav(call,
-               "🎤 Надішліть <b>голосове повідомлення 5–30 секунд</b> (або аудіофайл).\n\n"
-               "Порада: говоріть рівно, без музики й шуму, звичайним тоном. "
-               "Бот сам розпізнає, що ви сказали.",
+               "🎤 Надішліть <b>голосове або аудіофайл від 10 секунд до 5 хвилин</b>.\n\n"
+               "Бот сам вибере найчистіший фрагмент: ~10 с для озвучки та ~25 с для зміни голосу "
+               "(довший зразок для озвучки лише сповільнює й погіршує клон — так радять автори моделі).\n\n"
+               "💡 Для найкращого результату: тиха кімната, без музики, звичайний тон, мікрофон на одній відстані. "
+               "Хвилина-дві начитки дає боту з чого вибрати.",
                parse_mode="HTML", reply_markup=_kb_back())
 
 
@@ -366,21 +375,39 @@ async def handle_clone_audio(message: Message, state: FSMContext) -> None:
     if got is None:
         return
     data, dur = got
-    if dur and (dur < 3 or dur > 60):
-        await message.answer("⏱ Потрібен запис 5–30 секунд. Спробуйте ще раз.")
+    if dur and (dur < 3 or dur > MAX_CLONE_SEC):
+        await message.answer(f"⏱ Потрібен запис від 10 секунд до {MAX_CLONE_SEC // 60} хвилин. Спробуйте ще раз.")
         return
-    status = await message.answer("🧬 Розпізнаю, що ви сказали…")
+    status = await message.answer("🧬 Аналізую запис — шукаю найчистіший фрагмент…")
     try:
-        text = await cc.transcribe_audio(data)
+        ref = await cc.select_voice_ref(data, REF_TTS_SEC) if not dur or dur > REF_TTS_SEC + 2 else data
+        ref_vc = await cc.select_voice_ref(data, REF_VC_SEC) if dur and dur > REF_VC_SEC + 4 else None
+        await status.edit_text("🧬 Розпізнаю, що сказано у фрагменті…")
+        text = await cc.transcribe_audio(ref)
     except Exception as exc:
-        log.exception("clone transcribe failed")
+        log.exception("clone preparation failed")
         await status.edit_text(gq._friendly_error(exc), parse_mode="HTML", reply_markup=_kb_back())
         await state.clear()
         return
-    await state.update_data(clone_bytes_path=_stash(message.from_user.id, data), clone_text=text)
+    uid = message.from_user.id
+    ref_path = _stash(uid, ref)
+    vid = Path(ref_path).stem.split("_", 1)[1]
+    extra = {}
+    if ref_vc:
+        p = VOICES_DIR / f"{uid}_{vid}_vc.ogg"
+        p.write_bytes(ref_vc)
+        extra["clone_vc_path"] = str(p)
+    if dur and dur > REF_TTS_SEC + 2:
+        p = VOICES_DIR / f"{uid}_{vid}_full.ogg"      # kept for a future personal (LoRA) voice model
+        p.write_bytes(data)
+        extra["clone_full_path"] = str(p)
+    await state.update_data(clone_bytes_path=ref_path, clone_text=text, clone_dur=dur, **extra)
     await state.set_state(VoiceState.clone_name)
+    picked = (f"🎯 З {int(dur)} с запису вибрано найкращі ~{int(REF_TTS_SEC)} с для озвучки"
+              + (f" і ~{int(REF_VC_SEC)} с для зміни голосу" if ref_vc else "") + ".\n\n") if dur and dur > REF_TTS_SEC + 2 else ""
     await status.edit_text(
-        f"✅ Розпізнано:\n<i>«{_esc(text[:500])}»</i>\n\n✍️ Як назвати цей голос? (напр. «Мій голос», «Тато»)",
+        f"✅ {picked}Розпізнано у фрагменті:\n<i>«{_esc(text[:400])}»</i>\n\n"
+        "✍️ Як назвати цей голос? (напр. «Мій голос», «Тато»)",
         parse_mode="HTML", reply_markup=_kb_back())
 
 
@@ -401,8 +428,12 @@ async def handle_clone_name(message: Message, state: FSMContext) -> None:
         return
     uid = message.from_user.id
     vid = Path(path).stem.split("_", 1)[1]
-    voices = _my_voices(uid) + [{"id": vid, "name": message.text.strip()[:40], "file": path,
-                                  "ref_text": data.get("clone_text", ""), "created": int(time.time())}]
+    entry = {"id": vid, "name": message.text.strip()[:40], "file": path,
+             "ref_text": data.get("clone_text", ""), "created": int(time.time())}
+    for key, field in (("clone_vc_path", "file_vc"), ("clone_full_path", "file_full")):
+        if data.get(key):
+            entry[field] = data[key]
+    voices = _my_voices(uid) + [entry]
     _save_voices(uid, voices)
     db.set_gen_setting(uid, "voice_current", f"my:{vid}")
     await message.answer(f"🧬 Голос <b>{_esc(message.text.strip()[:40])}</b> збережено й обрано!\n"
